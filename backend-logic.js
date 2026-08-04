@@ -1,0 +1,2369 @@
+// =====================================================================
+// Cloud POS backend business logic.
+//
+// This file is ported directly from the app's original embedded "simulated
+// backend" (backend.handle() + its ~50 route methods). The route table and
+// every rule (auth checks, role checks, validation, business logic) are
+// unchanged from the original app — only the storage layer changed, from
+// IndexedDB/localStorage calls to real PostgreSQL queries (see db/store.js),
+// and the couple of browser-only bits (simulated client IP, crypto.subtle)
+// now use real request data and Node's crypto.
+// =====================================================================
+
+const { bkGet, bkPut, bkDelete, bkAllByIndex, bkAll } = require('../db/store');
+const { getRequestContext } = require('./request-context');
+const crypto = require('crypto').webcrypto;
+
+// Ported from the frontend (module catalog + sector->module defaults),
+// needed here because registration/settings compute default module state.
+  const MODULE_CATALOG = {
+    barcode_scanning: { label: 'Barcode scanning', group: 'Core POS', built: true },
+    inventory: { label: 'Inventory management', group: 'Core POS', built: true },
+    suppliers: { label: 'Supplier management', group: 'Core POS', built: true },
+    purchase_orders: { label: 'Purchase orders', group: 'Core POS', built: true },
+    stock_transfers: { label: 'Stock transfers', group: 'Core POS', built: true },
+    returns: { label: 'Returns & exchanges', group: 'Core POS', built: true },
+    discounts: { label: 'Discounts', group: 'Core POS', built: true },
+    multiple_cashiers: { label: 'Multiple cashiers', group: 'Core POS', built: true },
+    multiple_payment_methods: { label: 'Multiple payment methods', group: 'Core POS', built: true },
+    low_stock_alerts: { label: 'Low stock alerts', group: 'Core POS', built: true },
+    reports: { label: 'Reports', group: 'Core POS', built: true },
+    receipt_printing: { label: 'Receipt printing', group: 'Core POS', built: true },
+    promotions: { label: 'Promotions', group: 'Core POS', built: false },
+    loyalty_points: { label: 'Loyalty points', group: 'Core POS', built: false },
+
+    batch_tracking: { label: 'Batch number tracking', group: 'Pharmacy & Medical', built: false },
+    expiry_management: { label: 'Expiry date management', group: 'Pharmacy & Medical', built: false },
+    prescription_sales: { label: 'Prescription sales', group: 'Pharmacy & Medical', built: false },
+    controlled_medicine_tracking: { label: 'Controlled medicine tracking', group: 'Pharmacy & Medical', built: false },
+    patient_registration: { label: 'Patient registration', group: 'Pharmacy & Medical', built: false },
+    appointments: { label: 'Appointments', group: 'Pharmacy & Medical', built: false },
+    consultation_billing: { label: 'Consultation billing', group: 'Pharmacy & Medical', built: false },
+    pharmacy_integration: { label: 'Pharmacy integration', group: 'Pharmacy & Medical', built: false },
+    lab_requests: { label: 'Laboratory requests', group: 'Pharmacy & Medical', built: false },
+    medical_reports: { label: 'Medical reports', group: 'Pharmacy & Medical', built: false },
+
+    fifo_rotation: { label: 'FIFO stock rotation', group: 'Cold Store & Warehouse', built: false },
+    temperature_records: { label: 'Temperature records', group: 'Cold Store & Warehouse', built: false },
+    multi_location_inventory: { label: 'Multi-location inventory', group: 'Cold Store & Warehouse', built: false },
+    stock_receiving: { label: 'Stock receiving', group: 'Cold Store & Warehouse', built: false },
+    dispatch: { label: 'Dispatch', group: 'Cold Store & Warehouse', built: false },
+    bulk_inventory: { label: 'Bulk inventory', group: 'Cold Store & Warehouse', built: false },
+    unit_conversion: { label: 'Unit conversion', group: 'Cold Store & Warehouse', built: false },
+    bulk_pricing: { label: 'Bulk pricing', group: 'Cold Store & Warehouse', built: false },
+
+    table_management: { label: 'Table management', group: 'Restaurant & Hospitality', built: false },
+    kot: { label: 'Kitchen Order Tickets (KOT)', group: 'Restaurant & Hospitality', built: false },
+    waiter_accounts: { label: 'Waiter accounts', group: 'Restaurant & Hospitality', built: false },
+    menu_categories: { label: 'Menu categories', group: 'Restaurant & Hospitality', built: false },
+    split_bills: { label: 'Split bills', group: 'Restaurant & Hospitality', built: false },
+    delivery_orders: { label: 'Delivery orders', group: 'Restaurant & Hospitality', built: false },
+    takeaway: { label: 'Takeaway', group: 'Restaurant & Hospitality', built: false },
+    kitchen_display: { label: 'Kitchen display', group: 'Restaurant & Hospitality', built: false },
+    food_reports: { label: 'Food reports', group: 'Restaurant & Hospitality', built: false },
+    room_management: { label: 'Room management', group: 'Restaurant & Hospitality', built: false },
+    reservations: { label: 'Reservations', group: 'Restaurant & Hospitality', built: false },
+    checkin_checkout: { label: 'Check-in / check-out', group: 'Restaurant & Hospitality', built: false },
+    guest_billing: { label: 'Guest billing', group: 'Restaurant & Hospitality', built: false },
+    housekeeping: { label: 'Housekeeping', group: 'Restaurant & Hospitality', built: false },
+    restaurant_integration: { label: 'Restaurant integration', group: 'Restaurant & Hospitality', built: false },
+
+    product_variants: { label: 'Product variants (size/color/brand)', group: 'Retail & Fashion', built: false },
+    barcode_labels: { label: 'Barcode labels', group: 'Retail & Fashion', built: false },
+    seasonal_discounts: { label: 'Seasonal discounts', group: 'Retail & Fashion', built: false },
+    imei_tracking: { label: 'IMEI tracking', group: 'Retail & Fashion', built: false },
+    serial_numbers: { label: 'Serial numbers', group: 'Retail & Fashion', built: false },
+    warranty_management: { label: 'Warranty management', group: 'Retail & Fashion', built: false },
+    repairs: { label: 'Repairs', group: 'Retail & Fashion', built: false },
+    accessories_bundling: { label: 'Accessories bundling', group: 'Retail & Fashion', built: false },
+
+    staff_commission: { label: 'Staff commission', group: 'Salon & Services', built: false },
+    services: { label: 'Services', group: 'Salon & Services', built: false },
+    customer_history: { label: 'Customer history', group: 'Salon & Services', built: false },
+    packages: { label: 'Packages', group: 'Salon & Services', built: false },
+
+    raw_materials: { label: 'Raw materials', group: 'Manufacturing', built: false },
+    production_orders: { label: 'Production orders', group: 'Manufacturing', built: false },
+    finished_goods: { label: 'Finished goods', group: 'Manufacturing', built: false },
+    bill_of_materials: { label: 'Bills of materials', group: 'Manufacturing', built: false },
+    production_reports: { label: 'Production reports', group: 'Manufacturing', built: false },
+  };
+
+  const CORE_RETAIL_MODULES = [
+    'barcode_scanning','inventory','suppliers','purchase_orders','stock_transfers','returns',
+    'discounts','multiple_cashiers','multiple_payment_methods','low_stock_alerts','reports','receipt_printing',
+  ];
+
+  // Sector -> module keys. Sectors not listed fall back to CORE_RETAIL_MODULES (SECTOR_DEFAULT_GROUP.default).
+  const SECTOR_MODULE_GROUPS = {
+    'Pharmacy': [...CORE_RETAIL_MODULES, 'batch_tracking','expiry_management','prescription_sales','controlled_medicine_tracking'],
+    'Pharmaceutical Wholesale': [...CORE_RETAIL_MODULES, 'batch_tracking','expiry_management','controlled_medicine_tracking','multi_location_inventory','bulk_inventory'],
+    'Hospital': ['patient_registration','appointments','consultation_billing','pharmacy_integration','lab_requests','medical_reports'],
+    'Clinic': ['patient_registration','appointments','consultation_billing','pharmacy_integration','lab_requests','medical_reports'],
+    'Medical Laboratory': ['patient_registration','appointments','lab_requests','medical_reports'],
+
+    'Supermarket': [...CORE_RETAIL_MODULES, 'promotions','loyalty_points'],
+    'Mini Mart': [...CORE_RETAIL_MODULES, 'promotions'],
+    'Grocery Store': [...CORE_RETAIL_MODULES, 'promotions'],
+    'Convenience Store': [...CORE_RETAIL_MODULES, 'promotions'],
+    'Retail Store': [...CORE_RETAIL_MODULES, 'promotions'],
+    'Department Store': [...CORE_RETAIL_MODULES, 'promotions','loyalty_points','product_variants'],
+
+    'Cold Store': [...CORE_RETAIL_MODULES, 'fifo_rotation','temperature_records','expiry_management'],
+    'Warehouse': [...CORE_RETAIL_MODULES, 'multi_location_inventory','stock_receiving','dispatch','bulk_inventory'],
+    'Wholesale Store': [...CORE_RETAIL_MODULES, 'bulk_inventory','bulk_pricing'],
+    'Distributor': [...CORE_RETAIL_MODULES, 'multi_location_inventory','stock_receiving','dispatch'],
+    'Import & Export Company': [...CORE_RETAIL_MODULES, 'multi_location_inventory','stock_receiving','dispatch'],
+    'Logistics Company': ['multi_location_inventory','stock_receiving','dispatch'],
+    'Courier Service': ['dispatch'],
+
+    'Hardware Store': [...CORE_RETAIL_MODULES, 'unit_conversion','bulk_pricing'],
+    'Building Materials Store': [...CORE_RETAIL_MODULES, 'unit_conversion','bulk_pricing'],
+    'Auto Parts Store': [...CORE_RETAIL_MODULES, 'serial_numbers','warranty_management'],
+
+    'Restaurant': ['table_management','kot','waiter_accounts','menu_categories','split_bills','delivery_orders','takeaway','kitchen_display','food_reports'],
+    'Fast Food': ['kot','menu_categories','delivery_orders','takeaway','kitchen_display','food_reports'],
+    'Café': ['table_management','menu_categories','takeaway','food_reports'],
+    'Bakery': [...CORE_RETAIL_MODULES, 'menu_categories'],
+    'Bar': ['table_management','menu_categories','split_bills','food_reports'],
+
+    'Hotel': ['room_management','reservations','checkin_checkout','guest_billing','housekeeping','restaurant_integration'],
+    'Guest House': ['room_management','reservations','checkin_checkout','guest_billing','housekeeping'],
+    'Resort': ['room_management','reservations','checkin_checkout','guest_billing','housekeeping','restaurant_integration'],
+
+    'Boutique': [...CORE_RETAIL_MODULES, 'product_variants','barcode_labels','seasonal_discounts'],
+    'Clothing Store': [...CORE_RETAIL_MODULES, 'product_variants','barcode_labels','seasonal_discounts'],
+    'Shoe Store': [...CORE_RETAIL_MODULES, 'product_variants','barcode_labels','seasonal_discounts'],
+
+    'Electronics Store': [...CORE_RETAIL_MODULES, 'imei_tracking','serial_numbers','warranty_management','repairs','accessories_bundling'],
+    'Mobile Phone Shop': [...CORE_RETAIL_MODULES, 'imei_tracking','serial_numbers','warranty_management','repairs'],
+    'Computer Store': [...CORE_RETAIL_MODULES, 'serial_numbers','warranty_management','repairs'],
+    'Appliance Store': [...CORE_RETAIL_MODULES, 'serial_numbers','warranty_management','repairs'],
+
+    'Salon': ['appointments','staff_commission','services','customer_history','packages'],
+    'Barbershop': ['appointments','staff_commission','services','customer_history'],
+    'Spa': ['appointments','staff_commission','services','customer_history','packages'],
+    'Fitness Center': ['appointments','staff_commission','services','customer_history','packages'],
+    'Laundry': ['services','customer_history'],
+    'Dry Cleaning': ['services','customer_history'],
+    'Veterinary Clinic': ['patient_registration','appointments','consultation_billing','medical_reports'],
+    'Optical Shop': [...CORE_RETAIL_MODULES, 'appointments','warranty_management'],
+
+    'Manufacturing Company': ['raw_materials','production_orders','finished_goods','bill_of_materials','production_reports'],
+    'Water Production Company': ['raw_materials','production_orders','finished_goods','production_reports'],
+  };
+
+  function sectorModules(sector){
+    return SECTOR_MODULE_GROUPS[sector] || CORE_RETAIL_MODULES;
+  }
+  function defaultModuleState(sector){
+    const enabled = new Set(sectorModules(sector));
+    const out = {};
+    Object.keys(MODULE_CATALOG).forEach(key => { out[key] = enabled.has(key); });
+    return out;
+  }
+
+
+// Ported from the frontend (used there for the sector picker UI, and here to
+// validate the sector submitted at registration — same array, single source
+// of truth would ideally live in a shared package, but keeping it identical
+// here matches the original app's validation exactly).
+const BUSINESS_SECTORS = [
+  'Supermarket','Mini Mart','Grocery Store','Pharmacy','Pharmaceutical Wholesale','Hospital','Clinic',
+  'Medical Laboratory','Cold Store','Warehouse','Wholesale Store','Retail Store','Department Store',
+  'Convenience Store','Boutique','Clothing Store','Shoe Store','Cosmetics Store','Perfume Store',
+  'Jewelry Store','Electronics Store','Mobile Phone Shop','Computer Store','Appliance Store',
+  'Furniture Store','Hardware Store','Building Materials Store','Auto Parts Store','Fuel Station',
+  'Restaurant','Fast Food','Café','Bakery','Bar','Hotel','Guest House','Resort','Salon','Barbershop',
+  'Spa','Laundry','Dry Cleaning','Fitness Center','Bookshop','Stationery Shop','Printing Shop',
+  'Gift Shop','Toy Store','Pet Shop','Agricultural Supply Store','Farm Produce Store',
+  'Water Production Company','Manufacturing Company','Distributor','Import & Export Company',
+  'Logistics Company','Courier Service','Travel Agency','School','Church','NGO','Optical Shop',
+  'Veterinary Clinic','Liquor Store','Fruit & Vegetable Store','Meat Shop','Seafood Store',
+  'Ice Cream Shop','Other',
+];
+
+  async function bkHash(password, salt){
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + password));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  const clean = (s, max = 200) => String(s == null ? '' : s).trim().slice(0, max);
+  const bkNewId = () => require('crypto').randomUUID();
+
+  // ================================================================
+  // STAGE 11 — SUBSCRIPTION, BILLING & PAYSTACK MODULE
+  // Everything below is additive: it plugs into the existing simulated
+  // backend above without touching Stage 1-10 logic. It mirrors what a
+  // real server would do (Billing Service / Subscription Service /
+  // Paystack Service / Invoice Service / Webhook Service / Notification
+  // Service), just implemented against IndexedDB instead of Postgres,
+  // and a fetch-to-Paystack call instead of a real network hop.
+  // ================================================================
+
+  const DAY_MS = 24 * 3600 * 1000;
+  const DEFAULT_GRACE_DAYS = 3;
+  const REMINDER_THRESHOLDS = [7, 3, 1, 0]; // days remaining that trigger a reminder
+
+  // Default plan catalog — seeded into the `plans` store once, then fully
+  // editable by the Super Admin from then on (edits persist in IDB).
+  const DEFAULT_PLANS = [
+    {
+      id: 'starter_trial', name: 'Starter Trial', slug: 'starter_trial', amount: 0, currency: 'GHS',
+      billingInterval: 'month', isTrialPlan: true, isActive: true, sortOrder: 0,
+      desc: '30-day free trial — full Starter feature set.',
+      limits: { maxUsers: 3, maxProducts: 100, maxBranches: 1, storageMb: 200 },
+      features: { reports: true, aiFeatures: false, premiumSupport: false },
+    },
+    {
+      id: 'starter', name: 'Starter', slug: 'starter', amount: 5000, currency: 'GHS',
+      billingInterval: 'month', isTrialPlan: false, isActive: true, sortOrder: 1,
+      desc: 'Single till, core POS + inventory.',
+      limits: { maxUsers: 3, maxProducts: 300, maxBranches: 1, storageMb: 500 },
+      features: { reports: true, aiFeatures: false, premiumSupport: false },
+    },
+    {
+      id: 'business', name: 'Business', slug: 'business', amount: 12000, currency: 'GHS',
+      billingInterval: 'month', isTrialPlan: false, isActive: true, sortOrder: 2,
+      desc: 'Multiple staff, suppliers, and reporting.',
+      limits: { maxUsers: 15, maxProducts: 5000, maxBranches: 3, storageMb: 5000 },
+      features: { reports: true, aiFeatures: false, premiumSupport: true },
+    },
+    {
+      id: 'enterprise', name: 'Enterprise', slug: 'enterprise', amount: 25000, currency: 'GHS',
+      billingInterval: 'month', isTrialPlan: false, isActive: true, sortOrder: 3,
+      desc: 'Full access: unlimited staff, offline sync, all reports, AI features.',
+      limits: { maxUsers: -1, maxProducts: -1, maxBranches: -1, storageMb: 50000 },
+      features: { reports: true, aiFeatures: true, premiumSupport: true },
+    },
+  ];
+
+  let bkSeeded = false;
+  async function bkSeedBillingDefaults(){
+    if(bkSeeded) return;
+    bkSeeded = true;
+    const existingPlans = await bkAll('plans');
+    if(!existingPlans.length){
+      for(const p of DEFAULT_PLANS) await bkPut('plans', p);
+    }
+    const existingAdmins = await bkAll('superAdmins');
+    if(!existingAdmins.length){
+      const salt = bkNewId();
+      await bkPut('superAdmins', {
+        email: 'admin@cloudpos.local',
+        name: 'Platform Super Admin',
+        passwordHash: await bkHash('SuperAdmin123!', salt),
+        salt,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  async function bkGetPlan(planId){ return bkGet('plans', planId); }
+  async function bkActivePlans(){ return (await bkAll('plans')).filter(p => p.isActive).sort((a, b) => a.sortOrder - b.sortOrder); }
+
+  function bkInvoiceNumber(date){
+    const ym = date.getFullYear() + String(date.getMonth() + 1).padStart(2, '0');
+    return 'INV-' + ym + '-' + Math.floor(10000 + Math.random() * 89999);
+  }
+
+  // --- Subscription lifecycle: trial -> active -> past_due (grace) -> expired ---
+  // Recomputes and persists status server-side (never trusts a cached client value).
+  async function bkComputeSubscription(businessId){
+    let sub = await bkGet('subscriptions', businessId);
+    if(!sub) return null;
+    const now = Date.now();
+    const grace = (sub.gracePeriodDays == null ? DEFAULT_GRACE_DAYS : sub.gracePeriodDays);
+
+    if(sub.status === 'paused'){
+      // Manually paused by Super Admin — left untouched by the auto lifecycle.
+    } else if(sub.status === 'trial'){
+      const trialEndMs = new Date(sub.trialEnd).getTime();
+      if(now > trialEndMs){
+        sub.status = 'trial_expired';
+        sub.graceEnd = new Date(trialEndMs + grace * DAY_MS).toISOString();
+      }
+    } else if(sub.status === 'trial_expired'){
+      if(now > new Date(sub.graceEnd).getTime()) sub.status = 'expired';
+    } else if(sub.status === 'active'){
+      const periodEndMs = new Date(sub.currentPeriodEnd).getTime();
+      if(now > periodEndMs){
+        sub.status = 'past_due';
+        sub.graceEnd = new Date(periodEndMs + grace * DAY_MS).toISOString();
+      }
+    } else if(sub.status === 'past_due'){
+      if(now > new Date(sub.graceEnd).getTime()) sub.status = 'expired';
+    }
+
+    // Days-remaining figure shown on dashboards/banners.
+    let daysRemaining = null;
+    let anchor = null;
+    if(sub.status === 'trial') anchor = sub.trialEnd;
+    else if(sub.status === 'active') anchor = sub.currentPeriodEnd;
+    else if(sub.status === 'trial_expired' || sub.status === 'past_due') anchor = sub.graceEnd;
+    if(anchor) daysRemaining = Math.max(0, Math.ceil((new Date(anchor).getTime() - now) / DAY_MS));
+
+    sub.daysRemaining = daysRemaining;
+    sub.readOnly = (sub.status === 'expired');
+    sub.inGrace = (sub.status === 'trial_expired' || sub.status === 'past_due');
+
+    await bkPut('subscriptions', sub);
+    return sub;
+  }
+
+  // Blocks write actions once a business is in read-only (expired) mode.
+  // Super admins are never blocked (they need access to manage billing itself).
+  async function bkRequireActiveSubscription(session){
+    if(session.role === 'super_admin') return;
+    const sub = await bkComputeSubscription(session.businessId);
+    if(sub && sub.readOnly){
+      throw new Error('Your subscription has expired. Renew from the Billing tab to create sales, add products, or manage inventory, staff, customers, and suppliers.');
+    }
+  }
+
+  async function bkCreateTrialSubscription(businessId){
+    const now = new Date();
+    const trialEnd = new Date(now.getTime() + 30 * DAY_MS);
+    const sub = {
+      businessId, planId: 'starter_trial', status: 'trial',
+      trialStart: now.toISOString(), trialEnd: trialEnd.toISOString(),
+      currentPeriodStart: null, currentPeriodEnd: null, graceEnd: null,
+      gracePeriodDays: DEFAULT_GRACE_DAYS, cancelAtPeriodEnd: false,
+      lastReminderDays: null, createdAt: now.toISOString(), updatedAt: now.toISOString(),
+    };
+    await bkPut('subscriptions', sub);
+    await bkPut('trialHistory', { businessId, trialStart: sub.trialStart, trialEnd: sub.trialEnd, converted: false, convertedAt: null });
+    return sub;
+  }
+
+  // --- Reminders (dashboard notification now; email/SMS/WhatsApp are
+  // architecture-ready stubs — wire a real provider into these three
+  // functions when this module runs against a real backend). ---
+  async function bkQueueNotification(businessId, channel, message){
+    await bkPut('notifications', { id: bkNewId(), businessId, channel, message, status: 'queued', createdAt: new Date().toISOString() });
+  }
+  async function bkSendEmailReminder(business, message){
+    await bkQueueNotification(business.id, 'email', message);
+    // Real implementation: emailService.send({ to: business.email, template: 'subscription_reminder', message }).
+  }
+  async function bkSendSmsReminder(business, message){
+    await bkQueueNotification(business.id, 'sms', message);
+    // Real implementation: smsService.send({ to: business.phone, message }).
+  }
+  async function bkSendWhatsappReminder(business, message){
+    await bkQueueNotification(business.id, 'whatsapp', message);
+    // Real implementation: whatsappService.send({ to: business.phone, message }).
+  }
+  async function bkCheckReminders(session, sub){
+    if(sub.daysRemaining == null) return;
+    if(!REMINDER_THRESHOLDS.includes(sub.daysRemaining)) return;
+    if(sub.lastReminderDays === sub.daysRemaining) return; // already sent for this milestone
+    const business = await bkGet('businesses', session.businessId);
+    if(!business) return;
+    const label = sub.status === 'trial' ? 'trial' : 'subscription';
+    const message = sub.daysRemaining === 0
+      ? `Your ${label} has expired today.`
+      : `Your ${label} ends in ${sub.daysRemaining} day${sub.daysRemaining === 1 ? '' : 's'}.`;
+    await bkSendEmailReminder(business, message);
+    await bkSendSmsReminder(business, message);
+    await bkSendWhatsappReminder(business, message);
+    sub.lastReminderDays = sub.daysRemaining;
+    await bkPut('subscriptions', sub);
+  }
+
+  // --- Paystack simulation ---
+  // In production this calls POST https://api.paystack.co/transaction/initialize
+  // and, on return, verifies via GET /transaction/verify/:reference — with the
+  // subscription only ever updated after that server-side verification, and a
+  // webhook (POST /webhooks/paystack, signature checked against
+  // x-paystack-signature using the secret key) as the source of truth, so a
+  // user closing the tab mid-payment can't fake success from the frontend.
+  const PAYSTACK_METHOD_LABEL = { card: 'Debit/Credit Card', mobile_money: 'Mobile Money', bank_transfer: 'Bank Transfer' };
+
+  async function bkPaystackInitialize(session, body){
+    const planId = clean(body.planId || body.planType, 40);
+    const paymentMethod = clean(body.paymentMethod, 30) || 'card';
+    const promoCode = clean(body.promoCode, 40).toUpperCase();
+    const plan = await bkGetPlan(planId);
+    if(!plan || !plan.isActive) throw new Error('Unknown or inactive plan.');
+    if(plan.isTrialPlan) throw new Error('The trial plan cannot be purchased directly.');
+
+    let amount = plan.amount;
+    let discount = null;
+    if(promoCode){
+      const promo = await bkGet('promoCodes', promoCode);
+      if(promo && promo.isActive && (!promo.validUntil || new Date(promo.validUntil) > new Date()) && (promo.maxUses == null || promo.usedCount < promo.maxUses)){
+        const off = promo.percentOff ? Math.round(amount * promo.percentOff / 100) : (promo.amountOff || 0);
+        amount = Math.max(0, amount - off);
+        discount = { code: promoCode, amountOff: off };
+      }
+    }
+
+    const business = await bkGet('businesses', session.businessId);
+    const reference = 'PSK_' + bkNewId().replace(/-/g, '').slice(0, 20);
+    await bkPut('payments', {
+      id: bkNewId(), businessId: session.businessId, planId, planType: plan.slug, amount, currency: plan.currency,
+      paymentMethod, transactionReference: reference, paystackReference: reference, status: 'pending',
+      discount, createdAt: new Date().toISOString(),
+    });
+    // Real Paystack init returns { authorization_url, access_code, reference } — simulated here.
+    return {
+      reference, authorizationUrl: '#simulated-paystack-checkout', accessCode: bkNewId(),
+      publicKey: 'pk_test_simulated', amount, currency: plan.currency, email: business ? business.email : '',
+      planId, planLabel: plan.name, method: PAYSTACK_METHOD_LABEL[paymentMethod] || paymentMethod,
+    };
+  }
+
+  // Shared, idempotent core used by both the webhook handler and the
+  // "verify after redirect" call the frontend makes — matches the spec's
+  // "never trust the frontend alone" requirement even in this simulation:
+  // the payment is only ever marked successful here, after being looked
+  // up server-side by reference.
+  async function bkProcessPaystackEvent(reference, eventType){
+    const eventKey = eventType + ':' + reference;
+    const already = await bkAllByIndex('webhookLogs', 'by_event', eventKey).catch(() => []);
+    if(already.length){
+      return { duplicate: true, payment: null, subscription: null, invoice: null };
+    }
+
+    const allPayments = await bkAll('payments');
+    const payment = allPayments.find(p => p.transactionReference === reference);
+    if(!payment) throw new Error('Payment reference not found.');
+
+    await bkPut('webhookLogs', {
+      id: bkNewId(), eventKey, provider: 'paystack', eventType, reference,
+      businessId: payment.businessId, signatureValid: true, processed: false, createdAt: new Date().toISOString(),
+    });
+
+    if(eventType === 'charge.failed'){
+      payment.status = 'failed';
+      await bkPut('payments', payment);
+      return { duplicate: false, payment, subscription: null, invoice: null };
+    }
+    if(eventType !== 'charge.success'){
+      return { duplicate: false, payment, subscription: null, invoice: null };
+    }
+
+    payment.status = 'success';
+    payment.paidAt = new Date().toISOString();
+    await bkPut('payments', payment);
+
+    const plan = await bkGetPlan(payment.planId);
+    const now = new Date();
+    const nextPeriodEnd = new Date(now.getTime() + 30 * DAY_MS);
+
+    let sub = await bkGet('subscriptions', payment.businessId);
+    const wasTrial = sub && sub.status === 'trial';
+    sub = sub || {};
+    sub.businessId = payment.businessId;
+    sub.planId = payment.planId;
+    sub.status = 'active';
+    sub.currentPeriodStart = now.toISOString();
+    sub.currentPeriodEnd = nextPeriodEnd.toISOString();
+    sub.graceEnd = null;
+    sub.gracePeriodDays = sub.gracePeriodDays == null ? DEFAULT_GRACE_DAYS : sub.gracePeriodDays;
+    sub.lastReminderDays = null;
+    sub.updatedAt = now.toISOString();
+    await bkPut('subscriptions', sub);
+
+    if(wasTrial){
+      const th = await bkGet('trialHistory', payment.businessId);
+      if(th){ th.converted = true; th.convertedAt = now.toISOString(); await bkPut('trialHistory', th); }
+
+      // Stage 14: refer-a-friend reward — the referee's first paid conversion
+      // marks the referral "converted" and gives the referrer 7 free days,
+      // credited straight onto their current subscription period.
+      const refs = await bkAllByIndex('referrals', 'by_referee', payment.businessId);
+      const pendingReferral = refs.find(r => r.status === 'signed_up');
+      if(pendingReferral){
+        pendingReferral.status = 'converted';
+        pendingReferral.convertedAt = now.toISOString();
+        await bkPut('referrals', pendingReferral);
+
+        const referrerSub = await bkGet('subscriptions', pendingReferral.referrerBusinessId);
+        if(referrerSub && referrerSub.currentPeriodEnd){
+          referrerSub.currentPeriodEnd = new Date(new Date(referrerSub.currentPeriodEnd).getTime() + 7 * DAY_MS).toISOString();
+          await bkPut('subscriptions', referrerSub);
+          await bkAudit(pendingReferral.referrerBusinessId, null, 'referral_reward', `+7 days — ${pendingReferral.refereeBusinessName} subscribed`, {
+            userName: 'System (Referrals)', role: 'system',
+          });
+        }
+      }
+    } else {
+      await bkPut('renewalLogs', {
+        id: bkNewId(), businessId: payment.businessId, subscriptionId: payment.businessId,
+        previousPeriodEnd: sub.currentPeriodStart, newPeriodEnd: sub.currentPeriodEnd,
+        paymentId: payment.id, createdAt: now.toISOString(),
+      });
+      await bkAudit(payment.businessId, null, 'subscription_renewed', plan ? plan.name : payment.planType, {
+        userName: 'System (Paystack)', role: 'system',
+        previousValue: sub.currentPeriodStart, newValue: sub.currentPeriodEnd,
+      });
+    }
+
+    const invoice = {
+      id: bkNewId(), invoiceNumber: bkInvoiceNumber(now), businessId: payment.businessId, paymentId: payment.id,
+      planId: payment.planId, planName: plan ? plan.name : payment.planType, amount: payment.amount,
+      taxAmount: 0, totalAmount: payment.amount, currency: payment.currency, paymentMethod: payment.paymentMethod,
+      paymentDate: now.toISOString(), renewalDate: nextPeriodEnd.toISOString(), createdAt: now.toISOString(),
+    };
+    await bkPut('invoices', invoice);
+
+    const wh = (await bkAllByIndex('webhookLogs', 'by_event', eventKey))[0];
+    if(wh){ wh.processed = true; wh.processedAt = now.toISOString(); await bkPut('webhookLogs', wh); }
+
+    return { duplicate: false, payment, subscription: sub, invoice };
+  }
+
+  function bkInvoiceTextFile(invoice, business){
+    return [
+      'CLOUD POS — INVOICE',
+      '====================',
+      `Invoice Number: ${invoice.invoiceNumber}`,
+      `Business:       ${business ? business.name : invoice.businessId}`,
+      `Plan:           ${invoice.planName}`,
+      `Amount:         ${invoice.currency} ${(invoice.amount / 100).toFixed(2)}`,
+      `Tax:            ${invoice.currency} ${(invoice.taxAmount / 100).toFixed(2)}`,
+      `Total:          ${invoice.currency} ${(invoice.totalAmount / 100).toFixed(2)}`,
+      `Payment method: ${PAYSTACK_METHOD_LABEL[invoice.paymentMethod] || invoice.paymentMethod}`,
+      `Payment date:   ${new Date(invoice.paymentDate).toLocaleString()}`,
+      `Renewal date:   ${new Date(invoice.renewalDate).toLocaleDateString()}`,
+      '',
+      'Thank you for your business.',
+    ].join('\n');
+  }
+
+  // --- Stage 12: audit trail helpers ---
+  const AUDIT_MODULE_MAP = [
+    [/^business_/, 'Business'], [/^trial_/, 'Billing'], [/^payment_/, 'Billing'],
+    [/^subscription_/, 'Billing'], [/^invoice_/, 'Billing'],
+    [/^product_/, 'Products'], [/^supplier_/, 'Suppliers'], [/^purchase_/, 'Purchases'],
+    [/^sale_/, 'Sales'], [/^user_/, 'Staff'], [/^role_/, 'Staff'],
+    [/^customer_/, 'Customers'], [/^backup_/, 'Backups'], [/^restore_/, 'Backups'],
+    [/^audit_/, 'Audit'], [/^login|^logout/, 'Auth'],
+  ];
+  function bkModuleForAction(action){
+    const hit = AUDIT_MODULE_MAP.find(([re]) => re.test(action));
+    return hit ? hit[1] : 'General';
+  }
+  function bkParseBrowser(ua){
+    if(!ua) return 'Unknown';
+    if(/Edg\//.test(ua)) return 'Edge';
+    if(/Chrome\//.test(ua) && !/Chromium/.test(ua)) return 'Chrome';
+    if(/Firefox\//.test(ua)) return 'Firefox';
+    if(/Safari\//.test(ua) && !/Chrome/.test(ua)) return 'Safari';
+    return 'Other';
+  }
+  // This is a fully local, offline-capable app with no real server — there is
+  // no genuine client IP to read. We simulate a stable per-device identifier
+  // (persisted in localStorage) so audit logs still show a consistent "IP
+  // Address" column the way a real deployment's request logger would.
+  function bkClientIp(){
+    const ctx = getRequestContext();
+    return (ctx && ctx.ip) || 'unknown';
+  }
+
+  /**
+   * extra: { module, recordLabel, previousValue, newValue, userName, role }
+   * `detail` remains a short human-readable summary (back-compat with all
+   * Stage 1-11 call sites that only pass 4 arguments).
+   */
+  async function bkAudit(businessId, userId, action, detail, extra){
+    extra = extra || {};
+    try{
+      let userName = extra.userName, role = extra.role;
+      if(userId && (!userName || !role)){
+        const u = await bkGet('users', userId).catch(() => null);
+        if(u){ userName = userName || u.name; role = role || u.role; }
+      }
+      const ctx = getRequestContext(); const ua = (ctx && ctx.userAgent) || '';
+      await bkPut('auditLogs', {
+        id: bkNewId(),
+        businessId: businessId || null,
+        userId: userId || null,
+        userName: userName || (userId ? '—' : 'System'),
+        role: role || (userId ? '—' : 'system'),
+        action,
+        module: extra.module || bkModuleForAction(action),
+        affectedRecord: extra.recordLabel || detail || null,
+        previousValue: extra.previousValue != null ? String(extra.previousValue) : null,
+        newValue: extra.newValue != null ? String(extra.newValue) : null,
+        detail: detail || null,
+        ip: bkClientIp(),
+        browser: bkParseBrowser(ua),
+        device: /Mobi|Android|iPhone|iPad/i.test(ua) ? 'Mobile' : 'Desktop',
+        createdAt: new Date().toISOString(),
+      });
+    }catch(e){ /* logging is best-effort — never block the action it's logging */ }
+  }
+
+  // ================================================================
+  // STAGE 12 — AUTOMATIC BACKUPS (encrypted, per-business)
+  // ================================================================
+
+  function bkBufToB64(buf){
+    let binary = '';
+    const bytes = new Uint8Array(buf);
+    const chunk = 0x8000;
+    for(let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    return btoa(binary);
+  }
+  function bkB64ToBuf(b64){
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for(let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  // Backups are encrypted at rest with AES-256-GCM, keyed per business (PBKDF2
+  // over the business ID). This is a local-only app so there's no real secret
+  // manager to hold the key server-side — this mirrors "secure encrypted
+  // storage" for the data at rest inside IndexedDB.
+  async function bkDeriveBackupKey(businessId){
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey('raw', enc.encode('cloudpos-backup:' + businessId), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: enc.encode('cloudpos-backup-salt'), iterations: 100000, hash: 'SHA-256' },
+      keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+    );
+  }
+  async function bkEncryptJson(businessId, obj){
+    const key = await bkDeriveBackupKey(businessId);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = new TextEncoder().encode(JSON.stringify(obj));
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
+    return { iv: bkBufToB64(iv), data: bkBufToB64(cipher) };
+  }
+  async function bkDecryptJson(businessId, payload){
+    const key = await bkDeriveBackupKey(businessId);
+    const iv = bkB64ToBuf(payload.iv);
+    const data = bkB64ToBuf(payload.data);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    return JSON.parse(new TextDecoder().decode(plain));
+  }
+  async function bkSnapshotBusiness(businessId){
+    const [products, suppliers, purchases, sales, customers, users] = await Promise.all([
+      bkAllByIndex('lproducts', 'by_business', businessId),
+      bkAllByIndex('suppliers', 'by_business', businessId),
+      bkAllByIndex('purchases', 'by_business', businessId),
+      bkAllByIndex('lsales', 'by_business', businessId),
+      bkAllByIndex('customers', 'by_business', businessId),
+      bkAllByIndex('users', 'by_business', businessId),
+    ]);
+    return {
+      schemaVersion: BK_DB_VERSION, businessId, snapshotAt: new Date().toISOString(),
+      products, suppliers, purchases, sales, customers,
+      // Never back up password hashes/salts — only what's needed to restore identity.
+      users: users.map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role, createdAt: u.createdAt })),
+    };
+  }
+  function bkPublicBackup(r){
+    const { iv, data, ...rest } = r;
+    return rest;
+  }
+
+  // --- Stage 13: default business settings/receipt/preferences, seeded once per business ---
+  function bkDefaultSettings(businessId, business){
+    return {
+      businessId,
+      general: {
+        name: business.name || '',
+        logo: '',
+        address: business.address || '',
+        phone: business.phone || '',
+        email: business.email || '',
+        website: '',
+        taxNumber: '',
+        currency: 'GHS',
+        language: 'en',
+        timezone: 'Africa/Accra',
+        dateFormat: 'DD/MM/YYYY',
+        hours: '',
+        receiptHeader: '',
+        receiptFooter: '',
+      },
+      receipt: {
+        showLogo: false, showName: true, showAddress: true, showPhone: true,
+        showCashier: true, showBranch: true, showTxn: true, showBarcode: false,
+        thankYou: 'Thank you — come again!',
+        // --- receipt customization (Stage: professional receipt system) ---
+        brandColor: '#B8571A',
+        showEmail: true, showWebsite: false, showTax: true,
+        showCustomer: true, showSku: true, showDiscountColumn: true,
+        showQr: true, showSectorFields: true, showLoyaltyPoints: false,
+        loyaltyPointsPer: 10,
+        defaultFormat: '80mm',
+        returnPolicy: 'Items may be returned within 7 days with this receipt.',
+        supportPhone: '', supportEmail: '',
+        socialFacebook: '', socialInstagram: '', socialTwitter: '', socialWhatsapp: '',
+        poweredByEnabled: true,
+      },
+      preferences: {
+        defaultPayment: 'cash', negativeStock: 'block', taxRate: 0, lowStockThreshold: 5,
+        taxEnabled: false, discountEnabled: false, autoPrint: true, autoInvoice: true, autoReceipt: true,
+      },
+      modules: defaultModuleState(business.sector || ''),
+      security: {
+        sessionTimeoutMinutes: 480,
+        autoLockMinutes: 15,
+        autoLockEnabled: false,
+        requireApprovalForDiscount: false,
+        discountApprovalThreshold: 10,
+      },
+      till: {
+        enabled: false,
+        defaultFloat: 0,
+        requireTillCount: false,
+      },
+      notifications: {
+        // Not yet wired to a real mail/SMS provider — recorded here the same
+        // way sector modules are, so the intent is saved and ready for when
+        // a Notification Service is connected.
+        lowStockEmailDigest: false,
+        dailySummaryEmail: false,
+        notifyEmail: '',
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  // --- session / auth (business_id and role always come from here, NEVER from the request body) ---
+  async function bkSession(token){
+    if(!token) throw new Error('Not authenticated. Please log in again.');
+    const session = await bkGet('sessions', token);
+    if(!session || session.expiresAt < Date.now()) throw new Error('Session expired. Please log in again.');
+    return session;
+  }
+  function bkRequireRole(session, allowed){
+    if(!allowed.includes(session.role)) throw new Error('You do not have permission to perform this action.');
+  }
+
+  // --- simple login rate limiting (mirrors "rate limit sensitive endpoints") ---
+  const bkLoginAttempts = new Map();
+  function bkCheckLoginRate(email){
+    const rec = bkLoginAttempts.get(email);
+    if(rec && rec.lockUntil && rec.lockUntil > Date.now()){
+      throw new Error('Too many failed login attempts. Try again in a few minutes.');
+    }
+  }
+  function bkRegisterLoginFailure(email){
+    const rec = bkLoginAttempts.get(email) || { count: 0, lockUntil: 0 };
+    rec.count += 1;
+    if(rec.count >= 5){ rec.lockUntil = Date.now() + 15 * 60 * 1000; rec.count = 0; }
+    bkLoginAttempts.set(email, rec);
+  }
+  function bkClearLoginFailures(email){ bkLoginAttempts.delete(email); }
+
+  function bkPage(list, params){
+    const page = Math.max(parseInt(params.get('page') || '1', 10) || 1, 1);
+    const limit = Math.max(parseInt(params.get('limit') || '10', 10) || 10, 1);
+    const total = list.length;
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
+    const start = (page - 1) * limit;
+    return { items: list.slice(start, start + limit), pagination: { page, limit, total, totalPages } };
+  }
+  const bkYm = (d) => { const dt = new Date(d); return dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0'); };
+
+  const backend = {
+    async handle(method, pathname, params, body, token){
+      await bkSeedBillingDefaults();
+
+      // --- auth ---
+      if(method === 'POST' && pathname === '/businesses/register') return this.registerBusiness(body);
+      if(method === 'POST' && pathname === '/auth/login') return this.login(body);
+      if(method === 'POST' && pathname === '/webhooks/paystack') return this.paystackWebhook(body);
+      if(method === 'GET' && pathname === '/plans') return { plans: await bkActivePlans() };
+      if(method === 'GET' && pathname === '/public/receipts/verify') return this.publicVerifyReceipt(params);
+      if(method === 'POST' && pathname === '/auth/forgot-password') return this.forgotPassword(body);
+      if(method === 'POST' && pathname === '/auth/reset-password') return this.resetPasswordWithToken(body);
+
+      // Everything below requires a valid session.
+      const session = await bkSession(token);
+
+      if(method === 'GET' && pathname === '/businesses/me') return this.businessMe(session);
+      if(method === 'GET' && pathname === '/users') return this.listUsers(session);
+      if(method === 'POST' && pathname === '/users') return this.createUser(session, body);
+      let um;
+      if(method === 'POST' && (um = pathname.match(/^\/users\/([^/]+)\/reset-password$/))) return this.resetUserPassword(session, um[1], body);
+      if(method === 'POST' && pathname === '/auth/logout') return this.logout(session);
+      if(method === 'GET' && pathname === '/auth/session') return this.getSessionInfo(session);
+      if(method === 'POST' && pathname === '/auth/verify-manager') return this.verifyManagerPin(session, body);
+
+      // --- Cash & till management ---
+      if(method === 'POST' && pathname === '/till/open') return this.openTill(session, body);
+      if(method === 'GET' && pathname === '/till/current') return this.currentTill(session, params);
+      if(method === 'POST' && pathname === '/till/close') return this.closeTill(session, body);
+      if(method === 'GET' && pathname === '/till/history') return this.tillHistory(session, params);
+
+      // --- Stage 12: audit log ---
+      if(method === 'GET' && pathname === '/audit-logs') return this.listAuditLogs(session, params);
+      if(method === 'DELETE' && pathname === '/audit-logs/purge') return this.purgeAuditLogs(session, params);
+
+      // --- Stage 12: automatic backups ---
+      if(method === 'GET' && pathname === '/backups') return this.listBackups(session);
+      if(method === 'POST' && pathname === '/backups/run') return this.runBackup(session, body);
+      let bm;
+      if(method === 'POST' && (bm = pathname.match(/^\/backups\/([^/]+)\/restore$/))) return this.restoreBackup(session, bm[1]);
+      if(method === 'GET' && pathname === '/admin/backups') return this.adminBackupHealth(session);
+
+      // --- Stage 12: manual business data export ---
+      if(method === 'GET' && pathname === '/export/data') return this.exportData(session, params);
+
+      // --- Stage 13: multi-branch management ---
+      if(method === 'GET' && pathname === '/referrals') return this.listReferrals(session);
+      if(method === 'GET' && pathname === '/branches') return this.listBranches(session);
+      if(method === 'POST' && pathname === '/branches') return this.createBranch(session, body);
+      let brm;
+      if(method === 'PUT' && (brm = pathname.match(/^\/branches\/([^/]+)$/))) return this.updateBranch(session, brm[1], body);
+      if(method === 'DELETE' && (brm = pathname.match(/^\/branches\/([^/]+)$/))) return this.deleteBranch(session, brm[1]);
+
+      // --- Stage 13: branch transfers ---
+      if(method === 'GET' && pathname === '/transfers') return this.listTransfers(session, params);
+      if(method === 'POST' && pathname === '/transfers') return this.createTransfer(session, body);
+      let trm;
+      if(method === 'POST' && (trm = pathname.match(/^\/transfers\/([^/]+)\/approve$/))) return this.approveTransfer(session, trm[1]);
+      if(method === 'POST' && (trm = pathname.match(/^\/transfers\/([^/]+)\/complete$/))) return this.completeTransfer(session, trm[1]);
+      if(method === 'POST' && (trm = pathname.match(/^\/transfers\/([^/]+)\/cancel$/))) return this.cancelTransfer(session, trm[1]);
+
+      // --- Stage 13: business settings, receipt settings, preferences ---
+      if(method === 'GET' && pathname === '/settings') return this.getSettings(session);
+      if(method === 'PUT' && pathname === '/settings/general') return this.updateSettings(session, 'general', body);
+      if(method === 'PUT' && pathname === '/settings/receipt') return this.updateSettings(session, 'receipt', body);
+      if(method === 'PUT' && pathname === '/settings/preferences') return this.updateSettings(session, 'preferences', body);
+      if(method === 'PUT' && pathname === '/settings/modules') return this.updateSettings(session, 'modules', body);
+      if(method === 'PUT' && pathname === '/settings/security') return this.updateSettings(session, 'security', body);
+      if(method === 'PUT' && pathname === '/settings/till') return this.updateSettings(session, 'till', body);
+      if(method === 'PUT' && pathname === '/settings/notifications') return this.updateSettings(session, 'notifications', body);
+
+      // --- Stage 13: data import ---
+      if(method === 'POST' && pathname === '/import') return this.importData(session, body);
+      if(method === 'GET' && pathname === '/import/logs') return this.listImportLogs(session);
+
+      // --- Stage 13: advanced search ---
+      if(method === 'GET' && pathname === '/search') return this.advancedSearch(session, params);
+
+      // --- Stage 13: super admin branch oversight ---
+      if(method === 'GET' && pathname === '/admin/branches') return this.adminListBranches(session);
+      let abm;
+      if(method === 'POST' && (abm = pathname.match(/^\/admin\/branches\/([^/]+)\/toggle$/))) return this.adminToggleBranch(session, abm[1]);
+
+      if(method === 'GET' && pathname === '/subscription/status') return this.subscriptionStatus(session);
+      if(method === 'POST' && pathname === '/payments/initialize') return this.paymentInit(session, body);
+      if(method === 'POST' && pathname === '/payments/verify') return this.paymentVerify(session, body);
+      if(method === 'GET' && pathname === '/payments/history') return this.paymentHistory(session);
+      if(method === 'GET' && pathname === '/invoices') return this.listInvoices(session);
+      if(method === 'GET' && pathname === '/billing/history') return this.billingHistory(session);
+
+      // --- Super Admin billing console ---
+      if(method === 'GET' && pathname === '/admin/overview') return this.adminOverview(session);
+      if(method === 'GET' && pathname === '/admin/plans') return this.adminListPlans(session);
+      if(method === 'POST' && pathname === '/admin/plans') return this.adminCreatePlan(session, body);
+      let am;
+      if(method === 'PUT' && (am = pathname.match(/^\/admin\/plans\/([^/]+)$/))) return this.adminUpdatePlan(session, am[1], body);
+      if(method === 'DELETE' && (am = pathname.match(/^\/admin\/plans\/([^/]+)$/))) return this.adminDeletePlan(session, am[1]);
+      if(method === 'GET' && pathname === '/admin/businesses') return this.adminListBusinesses(session);
+      if(method === 'POST' && (am = pathname.match(/^\/admin\/subscriptions\/([^/]+)\/extend$/))) return this.adminExtend(session, am[1], body);
+      if(method === 'POST' && (am = pathname.match(/^\/admin\/subscriptions\/([^/]+)\/pause$/))) return this.adminPause(session, am[1]);
+      if(method === 'POST' && (am = pathname.match(/^\/admin\/subscriptions\/([^/]+)\/resume$/))) return this.adminResume(session, am[1]);
+
+      if(method === 'GET' && pathname === '/products') return this.listProducts(session, params);
+      if(method === 'POST' && pathname === '/products') return this.createProduct(session, body);
+      let m;
+      if(method === 'PUT' && (m = pathname.match(/^\/products\/([^/]+)$/))) return this.updateProduct(session, m[1], body);
+      if(method === 'DELETE' && (m = pathname.match(/^\/products\/([^/]+)$/))) return this.deleteProduct(session, m[1]);
+      if(method === 'POST' && (m = pathname.match(/^\/products\/([^/]+)\/restock$/))) return this.restockProduct(session, m[1], body);
+      if(method === 'POST' && (m = pathname.match(/^\/products\/([^/]+)\/adjust$/))) return this.adjustProduct(session, m[1], body);
+
+      if(method === 'GET' && pathname === '/suppliers') return this.listSuppliers(session, params);
+      if(method === 'POST' && pathname === '/suppliers') return this.createSupplier(session, body);
+      if(method === 'PUT' && (m = pathname.match(/^\/suppliers\/([^/]+)$/))) return this.updateSupplier(session, m[1], body);
+      if(method === 'DELETE' && (m = pathname.match(/^\/suppliers\/([^/]+)$/))) return this.deleteSupplier(session, m[1]);
+
+      if(method === 'GET' && pathname === '/purchases') return this.listPurchases(session, params);
+      if(method === 'POST' && pathname === '/purchases') return this.createPurchase(session, body);
+
+      if(method === 'POST' && pathname === '/sales/sync') return this.syncSales(session, body);
+
+      if(method === 'GET' && pathname === '/reports/dashboard') return this.reportDashboard(session, params);
+      if(method === 'GET' && pathname === '/reports/cashflow') return this.reportCashflow(session);
+      if(method === 'GET' && pathname === '/reports/suppliers') return this.reportSuppliers(session);
+      if(method === 'GET' && pathname === '/reports/products/top') return this.reportProductsTop(session, params, false);
+      if(method === 'GET' && pathname === '/reports/products/least') return this.reportProductsTop(session, params, true);
+      if(method === 'GET' && pathname === '/reports/customers/top') return { customers: [] };
+      if(method === 'GET' && pathname === '/reports/customers/debtors') return { customers: [] };
+      if(method === 'GET' && pathname === '/reports/sales') return this.reportSalesTrend(session, params);
+
+      throw new Error('Unknown endpoint: ' + method + ' ' + pathname);
+    },
+
+    async logout(session){
+      await bkAudit(session.businessId, session.userId, 'logout', null, { userName: session.name, role: session.role });
+      return { ok: true };
+    },
+
+    // --- Stage 12: audit log ---
+    async listAuditLogs(session, params){
+      bkRequireRole(session, ['owner', 'manager', 'super_admin']);
+      let businessId = session.businessId;
+      if(session.role === 'super_admin'){
+        const requested = clean(params.get('businessId') || '', 80);
+        businessId = requested || null; // no business filter = platform-wide view
+      }
+      let list = businessId ? await bkAllByIndex('auditLogs', 'by_business', businessId) : await bkAll('auditLogs');
+
+      const from = params.get('from'); const to = params.get('to');
+      const userId = clean(params.get('userId') || '', 80);
+      const action = clean(params.get('action') || '', 80);
+      const module = clean(params.get('module') || '', 80);
+      const q = clean(params.get('q') || '', 200).toLowerCase();
+
+      if(from) list = list.filter(l => l.createdAt >= from);
+      if(to) list = list.filter(l => l.createdAt <= to + 'T23:59:59.999Z');
+      if(userId) list = list.filter(l => l.userId === userId);
+      if(action) list = list.filter(l => l.action === action);
+      if(module) list = list.filter(l => l.module === module);
+      if(q) list = list.filter(l =>
+        (l.affectedRecord || '').toLowerCase().includes(q) ||
+        (l.detail || '').toLowerCase().includes(q) ||
+        (l.userName || '').toLowerCase().includes(q) ||
+        (l.action || '').toLowerCase().includes(q));
+
+      list = list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const actions = Array.from(new Set(list.map(l => l.action))).sort();
+      const modules = Array.from(new Set(list.map(l => l.module))).sort();
+      const { items, pagination } = bkPage(list, params);
+      return { logs: items, pagination, actions, modules };
+    },
+
+    // Security: audit logs cannot be edited or deleted by ordinary users —
+    // only Super Admin can permanently remove logs, and only per a retention window.
+    async purgeAuditLogs(session, params){
+      bkRequireRole(session, ['super_admin']);
+      const days = Math.max(parseInt(params.get('olderThanDays'), 10) || 365, 30);
+      const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+      const all = await bkAll('auditLogs');
+      const toDelete = all.filter(l => l.createdAt < cutoff);
+      for(const l of toDelete) await bkDelete('auditLogs', l.id);
+      await bkAudit(null, session.userId, 'audit_purged', `${toDelete.length} log(s) older than ${days} day(s)`, { userName: session.name, role: session.role });
+      return { purged: toDelete.length };
+    },
+
+    // --- Stage 12: automatic + manual backups ---
+    async runBackup(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      const type = ['daily', 'weekly', 'monthly', 'manual'].includes(body.type) ? body.type : 'manual';
+      const id = bkNewId();
+      let record;
+      try{
+        const snapshot = await bkSnapshotBusiness(session.businessId);
+        const json = JSON.stringify(snapshot);
+        const payload = await bkEncryptJson(session.businessId, snapshot);
+        record = {
+          id, businessId: session.businessId, type, status: 'success', createdAt: new Date().toISOString(),
+          sizeBytes: json.length,
+          recordCounts: {
+            products: snapshot.products.length, suppliers: snapshot.suppliers.length,
+            purchases: snapshot.purchases.length, sales: snapshot.sales.length,
+            customers: snapshot.customers.length, users: snapshot.users.length,
+          },
+          iv: payload.iv, data: payload.data, encrypted: true,
+        };
+      }catch(e){
+        record = { id, businessId: session.businessId, type, status: 'failed', createdAt: new Date().toISOString(), error: e.message };
+      }
+      await bkPut('backups', record);
+      await bkAudit(session.businessId, session.userId, record.status === 'success' ? 'backup_created' : 'backup_failed',
+        `${type} backup — ${record.status}`, { recordLabel: id });
+      return { backup: bkPublicBackup(record) };
+    },
+
+    async listBackups(session){
+      bkRequireRole(session, ['owner', 'manager']);
+      const list = (await bkAllByIndex('backups', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+        .slice(0, 60)
+        .map(bkPublicBackup);
+      return { backups: list };
+    },
+
+    async restoreBackup(session, id){
+      bkRequireRole(session, ['owner']);
+      const record = await bkGet('backups', id);
+      if(!record || record.businessId !== session.businessId) throw new Error('Backup not found.');
+      if(record.status !== 'success') throw new Error('This backup did not complete successfully and cannot be restored.');
+
+      const snapshot = await bkDecryptJson(session.businessId, { iv: record.iv, data: record.data });
+      const restores = [
+        ['lproducts', snapshot.products], ['suppliers', snapshot.suppliers],
+        ['purchases', snapshot.purchases], ['lsales', snapshot.sales], ['customers', snapshot.customers],
+      ];
+      for(const [store, rows] of restores){
+        const existing = await bkAllByIndex(store, 'by_business', session.businessId);
+        for(const row of existing) await bkDelete(store, row.id);
+        for(const row of (rows || [])) await bkPut(store, row);
+      }
+
+      await bkAudit(session.businessId, session.userId, 'restore_completed',
+        `restored from ${record.type} backup taken ${new Date(record.createdAt).toLocaleString()}`, { recordLabel: id });
+      return { ok: true, restoredAt: new Date().toISOString(), snapshotFrom: record.createdAt };
+    },
+
+    async adminBackupHealth(session){
+      bkRequireRole(session, ['super_admin']);
+      const businesses = await bkAll('businesses');
+      const allBackups = await bkAll('backups');
+      const now = Date.now();
+      const rows = businesses.map(b => {
+        const mine = allBackups.filter(x => x.businessId === b.id);
+        const last = mine.slice().sort((a, c) => new Date(c.createdAt) - new Date(a.createdAt))[0];
+        const daysSince = last ? Math.floor((now - new Date(last.createdAt).getTime()) / 86400000) : null;
+        const failedBackups = mine.filter(x => x.status === 'failed').length;
+        let health = 'none';
+        if(last) health = daysSince <= 1 ? 'healthy' : daysSince <= 7 ? 'warning' : 'critical';
+        return {
+          businessId: b.id, businessName: b.name, lastBackupAt: last ? last.createdAt : null,
+          lastBackupType: last ? last.type : null, daysSinceBackup: daysSince,
+          totalBackups: mine.length, failedBackups, health,
+        };
+      });
+      return { businesses: rows };
+    },
+
+    // --- Stage 12: manual business data export (owner-initiated) ---
+    async exportData(session, params){
+      bkRequireRole(session, ['owner', 'manager']);
+      const type = clean(params.get('type') || '', 40);
+      const businessId = session.businessId;
+      const branchId = clean(params.get('branchId') || '', 80);
+      const byBranch = (list) => branchId ? list.filter(r => r.branchId === branchId) : list;
+      let columns, rows;
+      switch(type){
+        case 'products':
+          columns = ['name', 'barcode', 'category', 'selling_price', 'cost_price', 'stock_quantity', 'low_stock_alert_level'];
+          rows = byBranch(await bkAllByIndex('lproducts', 'by_business', businessId));
+          break;
+        case 'inventory':
+          columns = ['name', 'barcode', 'stock_quantity', 'low_stock_alert_level', 'selling_price', 'status'];
+          rows = byBranch(await bkAllByIndex('lproducts', 'by_business', businessId))
+            .map(p => ({ ...p, status: p.stock_quantity <= p.low_stock_alert_level ? 'LOW STOCK' : 'OK' }));
+          break;
+        case 'customers':
+          columns = ['name', 'phone', 'email', 'balance'];
+          rows = byBranch(await bkAllByIndex('customers', 'by_business', businessId));
+          break;
+        case 'suppliers':
+          columns = ['name', 'phone', 'email', 'address'];
+          rows = byBranch(await bkAllByIndex('suppliers', 'by_business', businessId));
+          break;
+        case 'sales':
+          columns = ['createdAt', 'clientTxnId', 'cashierName', 'paymentType', 'total'];
+          rows = byBranch(await bkAllByIndex('lsales', 'by_business', businessId));
+          break;
+        case 'purchases':
+          columns = ['createdAt', 'supplier_name', 'payment_status', 'total_cost'];
+          rows = byBranch(await bkAllByIndex('purchases', 'by_business', businessId));
+          break;
+        case 'audit_logs':
+          columns = ['createdAt', 'userName', 'role', 'action', 'module', 'affectedRecord', 'detail'];
+          rows = await bkAllByIndex('auditLogs', 'by_business', businessId);
+          break;
+        case 'subscription_history':
+          columns = ['createdAt', 'action', 'detail'];
+          rows = (await bkAllByIndex('auditLogs', 'by_business', businessId))
+            .filter(l => ['trial_started', 'payment_verified', 'subscription_paused', 'subscription_resumed', 'subscription_extended'].includes(l.action));
+          break;
+        case 'branches':
+          columns = ['name', 'address', 'phone', 'manager', 'hours', 'status'];
+          rows = await bkAllByIndex('branches', 'by_business', businessId);
+          break;
+        case 'transfers':
+          columns = ['transferNumber', 'fromBranchName', 'toBranchName', 'requestedBy', 'approvedBy', 'status', 'createdAt'];
+          rows = byBranch(await bkAllByIndex('transfers', 'by_business', businessId));
+          break;
+        case 'reports': {
+          const dash = await this.reportDashboard(session, params);
+          rows = [dash];
+          columns = Object.keys(dash);
+          break;
+        }
+        default: throw new Error('Unknown export type: ' + type);
+      }
+      await bkAudit(businessId, session.userId, 'data_exported', type, { recordLabel: type, module: 'Backups' });
+      return { type, columns, rows };
+    },
+
+    async registerBusiness(body){
+      const businessName = clean(body.businessName, 120);
+      const businessEmail = clean(body.businessEmail, 160).toLowerCase();
+      const phone = clean(body.phone, 40);
+      const address = clean(body.address, 200);
+      const sectorRaw = clean(body.sector, 60);
+      const sectorOther = clean(body.sectorOther, 80);
+      const ownerName = clean(body.ownerName, 120);
+      const ownerEmail = clean(body.ownerEmail, 160).toLowerCase();
+      const ownerPassword = String(body.ownerPassword || '');
+      const referralCode = clean(body.referralCode, 80);
+      if(!businessName || !businessEmail || !ownerName || !ownerEmail || !ownerPassword){
+        throw new Error('Fill in every field before registering.');
+      }
+      if(!sectorRaw || !BUSINESS_SECTORS.includes(sectorRaw)) throw new Error('Select your business sector.');
+      if(sectorRaw === 'Other' && !sectorOther) throw new Error('Describe your business type in the "Other" field.');
+      if(ownerPassword.length < 8) throw new Error('Password must be at least 8 characters.');
+
+      // The sector picked drives which module keys default to enabled — "Other"
+      // falls back to the general retail module set until the owner customizes it.
+      const sectorLabel = sectorRaw === 'Other' ? sectorOther : sectorRaw;
+      const modules = defaultModuleState(sectorRaw);
+
+      const businessId = bkNewId();
+      await bkPut('businesses', {
+        id: businessId, name: businessName, email: businessEmail, phone, address,
+        sector: sectorRaw, sectorOther: sectorRaw === 'Other' ? sectorOther : '', sectorLabel,
+        createdAt: new Date().toISOString(),
+      });
+      const settings = bkDefaultSettings(businessId, { name: businessName, email: businessEmail, phone, address });
+      settings.modules = modules;
+      await bkPut('businessSettings', settings);
+
+      const salt = bkNewId();
+      const userId = bkNewId();
+      const user = {
+        id: userId, businessId, name: ownerName, email: ownerEmail,
+        passwordHash: await bkHash(ownerPassword, salt), salt, role: 'owner',
+        createdAt: new Date().toISOString(),
+      };
+      await bkPut('users', user);
+
+      const token = bkNewId() + '.' + bkNewId();
+      await bkPut('sessions', { token, userId, businessId, role: 'owner', name: ownerName, expiresAt: Date.now() + 8 * 3600 * 1000 });
+      await bkAudit(businessId, userId, 'business_registered', businessName + ' (' + sectorLabel + ')');
+
+      // Stage 11: every new business gets a 30-day free trial, starting from
+      // this exact signup timestamp (not the first of the month).
+      await bkCreateTrialSubscription(businessId);
+      await bkAudit(businessId, userId, 'trial_started', 'starter_trial (30 days)');
+
+      // Stage 14: refer-a-friend — a referral code is just the referring
+      // business's own id, taken from the ?ref= link they shared. Record it
+      // as "signed_up"; it's upgraded to "converted" once the new business
+      // makes its first real payment (see bkProcessPaystackEvent).
+      if(referralCode && referralCode !== businessId){
+        const referrer = await bkGet('businesses', referralCode);
+        if(referrer){
+          await bkPut('referrals', {
+            id: bkNewId(),
+            referrerBusinessId: referrer.id,
+            referrerBusinessName: referrer.name,
+            refereeBusinessId: businessId,
+            refereeBusinessName: businessName,
+            status: 'signed_up',
+            createdAt: new Date().toISOString(),
+            convertedAt: null,
+          });
+          await bkAudit(businessId, userId, 'referred_signup', `via ${referrer.name}`);
+        }
+      }
+
+      const modulesEnabledCount = Object.values(modules).filter(Boolean).length;
+
+      return {
+        token,
+        business: { id: businessId, name: businessName, email: businessEmail, phone, address, sector: sectorLabel },
+        user: { id: userId, name: ownerName, email: ownerEmail, role: 'owner', business_id: businessId, businessId },
+        modulesEnabledCount,
+      };
+    },
+
+    // --- Self-service "Forgot password" (standard request-token → email-link → set-new-password flow) ---
+    async forgotPassword(body){
+      const email = clean(body.email, 160).toLowerCase();
+      const businessId = clean(body.businessId, 80);
+      if(!email) throw new Error('Enter your email address.');
+      bkCheckLoginRate('fp:' + email);
+
+      let matches = await bkAllByIndex('users', 'by_email', email);
+      if(businessId) matches = matches.filter(u => u.businessId === businessId);
+
+      // Always return the same generic message whether or not the email is on
+      // file — this is standard practice so the endpoint can't be used to
+      // discover which emails have accounts.
+      const generic = { ok: true, message: 'If that email matches an account, a reset link has been sent to it.' };
+      if(matches.length !== 1){
+        bkRegisterLoginFailure('fp:' + email);
+        return generic;
+      }
+
+      const user = matches[0];
+      const token = bkNewId() + bkNewId();
+      user.resetToken = token;
+      user.resetTokenExpiresAt = Date.now() + 30 * 60 * 1000; // 30-minute expiry, standard for reset links
+      await bkPut('users', user);
+      await bkAudit(user.businessId, user.id, 'password_reset_requested', null, { module: 'Auth' });
+
+      // In production this token is delivered by the Notification Service as
+      // an emailed link (…#/reset-password?token=…) and never returned here.
+      // This demo backend has no real mail transport, so it hands the token
+      // back directly — the same pattern already used for the simulated
+      // Paystack checkout above — so the flow can be exercised end-to-end.
+      return { ...generic, devResetToken: token, devResetEmail: user.email };
+    },
+
+    async resetPasswordWithToken(body){
+      const token = clean(body.token, 160);
+      const newPassword = String(body.newPassword || '');
+      if(!token) throw new Error('Enter the reset code from your email.');
+      if(!newPassword || newPassword.length < 8) throw new Error('New password must be at least 8 characters.');
+
+      const allUsers = await bkAll('users');
+      const user = allUsers.find(u => u.resetToken && u.resetToken === token);
+      if(!user || !user.resetTokenExpiresAt || user.resetTokenExpiresAt < Date.now()){
+        throw new Error('This reset link is invalid or has expired. Request a new one.');
+      }
+
+      const salt = bkNewId();
+      user.passwordHash = await bkHash(newPassword, salt);
+      user.salt = salt;
+      delete user.resetToken;
+      delete user.resetTokenExpiresAt;
+      await bkPut('users', user);
+      bkClearLoginFailures(user.email);
+      await bkAudit(user.businessId, user.id, 'password_reset_completed', null, { module: 'Auth' });
+      return { ok: true };
+    },
+
+    // Reconstructs the same { user } shape login() returns, from an existing
+    // valid session — used to silently restore a session after a page
+    // reload instead of forcing the user back through the login screen.
+    async getSessionInfo(session){
+      let email = session.userId;
+      if(session.role !== 'super_admin'){
+        const user = await bkGet('users', session.userId);
+        if(!user) throw new Error('Session user not found.');
+        email = user.email;
+      }
+      return { user: { id: session.userId, name: session.name, email, role: session.role, businessId: session.businessId, business_id: session.businessId } };
+    },
+
+    async login(body){
+      const email = clean(body.email, 160).toLowerCase();
+      const password = String(body.password || '');
+      const businessId = clean(body.businessId, 80);
+      const asAdmin = !!body.asAdmin;
+      if(!email || !password) throw new Error('Enter your email and password.');
+
+      bkCheckLoginRate(email);
+
+      // Super Admin login is a separate identity space — never mixed with
+      // tenant users, and not scoped to any business.
+      if(asAdmin){
+        const admin = await bkGet('superAdmins', email);
+        if(!admin){ bkRegisterLoginFailure(email); throw new Error('Invalid super admin credentials.'); }
+        const candidateHash = await bkHash(password, admin.salt);
+        if(candidateHash !== admin.passwordHash){ bkRegisterLoginFailure(email); throw new Error('Invalid super admin credentials.'); }
+        bkClearLoginFailures(email);
+        const token = bkNewId() + '.' + bkNewId();
+        await bkPut('sessions', { token, userId: email, businessId: null, role: 'super_admin', name: admin.name, expiresAt: Date.now() + 8 * 3600 * 1000 });
+        return { token, user: { id: email, name: admin.name, email, role: 'super_admin', businessId: null, business_id: null } };
+      }
+
+      let matches = await bkAllByIndex('users', 'by_email', email);
+      if(businessId) matches = matches.filter(u => u.businessId === businessId);
+      if(matches.length > 1){
+        throw new Error('Multiple businesses use this email — enter the Business ID shown on your registration receipt.');
+      }
+      const user = matches[0];
+      if(!user){ bkRegisterLoginFailure(email); throw new Error('Invalid email or password.'); }
+
+      const candidateHash = await bkHash(password, user.salt);
+      if(candidateHash !== user.passwordHash){ bkRegisterLoginFailure(email); throw new Error('Invalid email or password.'); }
+
+      bkClearLoginFailures(email);
+      const token = bkNewId() + '.' + bkNewId();
+      const bizSettings = await bkGet('businessSettings', user.businessId);
+      const timeoutMinutes = (bizSettings && bizSettings.security && Number(bizSettings.security.sessionTimeoutMinutes)) || 480;
+      await bkPut('sessions', { token, userId: user.id, businessId: user.businessId, role: user.role, name: user.name, expiresAt: Date.now() + timeoutMinutes * 60 * 1000 });
+      await bkAudit(user.businessId, user.id, 'login', null);
+
+      return { token, user: { id: user.id, name: user.name, email: user.email, role: user.role, businessId: user.businessId, business_id: user.businessId } };
+    },
+
+    async businessMe(session){
+      const business = await bkGet('businesses', session.businessId);
+      if(!business) throw new Error('Business not found.');
+      return { business };
+    },
+
+    async listUsers(session){
+      const users = (await bkAllByIndex('users', 'by_business', session.businessId))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role, branchId: u.branchId || null }));
+      return { users };
+    },
+
+    async createUser(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const name = clean(body.name, 120);
+      const email = clean(body.email, 160).toLowerCase();
+      const password = String(body.password || '');
+      const role = clean(body.role, 30);
+      const branchId = clean(body.branchId || '', 80) || null;
+      if(!name || !email || !password) throw new Error('Fill in name, email, and password.');
+      if(password.length < 8) throw new Error('Password must be at least 8 characters.');
+      if(!['manager', 'cashier', 'storekeeper'].includes(role)) throw new Error('Invalid role.');
+
+      const existing = (await bkAllByIndex('users', 'by_email', email)).filter(u => u.businessId === session.businessId);
+      if(existing.length) throw new Error('A staff member with that email already exists in this business.');
+      if(branchId){
+        const branch = await bkGet('branches', branchId);
+        if(!branch || branch.businessId !== session.businessId) throw new Error('Selected branch was not found.');
+      }
+
+      const salt = bkNewId();
+      const user = {
+        id: bkNewId(), businessId: session.businessId, name, email,
+        passwordHash: await bkHash(password, salt), salt, role, branchId,
+        createdAt: new Date().toISOString(),
+      };
+      await bkPut('users', user);
+      await bkAudit(session.businessId, session.userId, 'user_added', email + ' (' + role + ')');
+      return { user: { id: user.id, name: user.name, email: user.email, role: user.role, branchId: user.branchId } };
+    },
+
+    // Only the business owner may reset another staff member's password.
+    async resetUserPassword(session, id, body){
+      bkRequireRole(session, ['owner']);
+      const user = await bkGet('users', id);
+      if(!user || user.businessId !== session.businessId) throw new Error('Staff member not found.');
+      const newPassword = String((body && body.newPassword) || '');
+      if(newPassword.length < 8) throw new Error('Password must be at least 8 characters.');
+      const salt = bkNewId();
+      user.passwordHash = await bkHash(newPassword, salt);
+      user.salt = salt;
+      await bkPut('users', user);
+      await bkAudit(session.businessId, session.userId, 'password_reset', user.email);
+      return { ok: true };
+    },
+
+    // --- Manager approval (e.g. a discount above the configured threshold) ---
+    // Any owner or manager on the same business can approve by re-entering
+    // their own password — this is the standard "manager override" pattern
+    // used on real POS terminals, without needing a separate PIN system.
+    async verifyManagerPin(session, body){
+      const email = clean(body.email, 160).toLowerCase();
+      const password = String(body.password || '');
+      if(!email || !password) throw new Error('Enter the approving manager\'s email and password.');
+      const matches = await bkAllByIndex('users', 'by_email', email);
+      const approver = matches.find(u => u.businessId === session.businessId);
+      if(!approver || !['owner', 'manager'].includes(approver.role)){
+        throw new Error('That account cannot approve overrides.');
+      }
+      const candidateHash = await bkHash(password, approver.salt);
+      if(candidateHash !== approver.passwordHash) throw new Error('Incorrect password.');
+      await bkAudit(session.businessId, session.userId, 'manager_override_approved', approver.name, { module: 'POS' });
+      return { ok: true, approverName: approver.name };
+    },
+
+    // --- Cash & till management ---
+    async openTill(session, body){
+      const existing = await this.currentTill(session, new URLSearchParams());
+      if(existing.till) throw new Error('A till is already open for you on this branch. Close it before opening a new one.');
+      const till = {
+        id: bkNewId(), businessId: session.businessId, branchId: session.branchId || clean(body.branchId || '', 80) || null,
+        cashierId: session.userId, cashierName: session.name,
+        openingFloat: Math.max(0, Number(body.openingFloat) || 0),
+        openedAt: new Date().toISOString(), status: 'open',
+      };
+      await bkPut('tillSessions', till);
+      await bkAudit(session.businessId, session.userId, 'till_opened', `Float ${till.openingFloat.toFixed(2)}`, { module: 'Till' });
+      return { till };
+    },
+
+    async currentTill(session, params){
+      const all = await bkAllByIndex('tillSessions', 'by_business', session.businessId);
+      const branchId = (params && clean(params.get('branchId') || '', 80)) || session.branchId || null;
+      const mine = all.filter(t => t.cashierId === session.userId && t.status === 'open' && (t.branchId || null) === (branchId || null));
+      return { till: mine[0] || null };
+    },
+
+    async closeTill(session, body){
+      const till = await bkGet('tillSessions', body.tillId);
+      if(!till || till.businessId !== session.businessId || till.status !== 'open') throw new Error('Open till not found.');
+      if(till.cashierId !== session.userId) bkRequireRole(session, ['owner', 'manager']);
+
+      const sales = await bkAllByIndex('lsales', 'by_business', session.businessId);
+      const shiftSales = sales.filter(s => s.cashierId === till.cashierId && new Date(s.createdAt) >= new Date(till.openedAt) && (s.paymentType || 'cash') === 'cash');
+      const expectedCash = till.openingFloat + shiftSales.reduce((sum, s) => sum + (Number(s.amountPaid) - Number(s.changeAmount || 0)), 0);
+      const countedCash = Math.max(0, Number(body.countedCash) || 0);
+
+      till.status = 'closed';
+      till.closedAt = new Date().toISOString();
+      till.expectedCash = +expectedCash.toFixed(2);
+      till.countedCash = countedCash;
+      till.variance = +(countedCash - expectedCash).toFixed(2);
+      till.cashSalesCount = shiftSales.length;
+      till.notes = clean(body.notes || '', 300);
+      await bkPut('tillSessions', till);
+      await bkAudit(session.businessId, session.userId, 'till_closed', `Variance ${till.variance.toFixed(2)}`, { module: 'Till' });
+      return { till };
+    },
+
+    async tillHistory(session, params){
+      bkRequireRole(session, ['owner', 'manager']);
+      const all = (await bkAllByIndex('tillSessions', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.openedAt) - new Date(a.openedAt));
+      return bkPage(all, params);
+    },
+
+    async subscriptionStatus(session){
+      const sub = session.businessId ? await bkComputeSubscription(session.businessId) : null;
+      if(sub) await bkCheckReminders(session, sub);
+      const plan = sub ? await bkGetPlan(sub.planId) : null;
+      return { subscription: sub, plan };
+    },
+
+    // POST /payments/initialize — mirrors POST /transaction/initialize on Paystack's real API.
+    async paymentInit(session, body){
+      return bkPaystackInitialize(session, body);
+    },
+
+    // POST /payments/verify — mirrors GET /transaction/verify/:reference. The
+    // frontend calls this right after the (simulated) Paystack redirect, but
+    // the actual state change happens in bkProcessPaystackEvent, exactly the
+    // same code path the webhook uses — so a lost webhook or a verify call
+    // arriving twice both resolve to the same, idempotent outcome.
+    async paymentVerify(session, body){
+      const reference = clean(body.reference, 120);
+      const result = await bkProcessPaystackEvent(reference, 'charge.success');
+      if(result.duplicate){
+        const sub = await bkComputeSubscription(session.businessId);
+        return { payment: null, subscription: sub, invoice: null, alreadyProcessed: true };
+      }
+      await bkAudit(session.businessId, session.userId, 'payment_verified', reference);
+      return { payment: result.payment, subscription: result.subscription, invoice: result.invoice };
+    },
+
+    // POST /webhooks/paystack — the real source of truth. In production this
+    // verifies the `x-paystack-signature` header (HMAC-SHA512 of the raw body
+    // using the Paystack secret key) before trusting `body` at all; simulated
+    // here since there is no real network hop, but the idempotency and
+    // "backend decides, not the client" behavior is identical.
+    async paystackWebhook(body){
+      const event = clean(body && body.event, 60) || 'charge.success';
+      const reference = clean(body && body.data && body.data.reference, 120);
+      if(!reference) throw new Error('Missing reference in webhook payload.');
+      const result = await bkProcessPaystackEvent(reference, event);
+      return { received: true, duplicate: !!result.duplicate };
+    },
+
+    async paymentHistory(session){
+      const payments = (await bkAllByIndex('payments', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return { payments };
+    },
+
+    async listInvoices(session){
+      const invoices = (await bkAllByIndex('invoices', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return { invoices };
+    },
+
+    async billingHistory(session){
+      const logs = (await bkAllByIndex('auditLogs', 'by_business', session.businessId))
+        .filter(l => ['trial_started', 'payment_verified', 'subscription_paused', 'subscription_resumed', 'subscription_extended'].includes(l.action))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return { history: logs };
+    },
+
+    // --- Super Admin billing console ---
+    async adminOverview(session){
+      bkRequireRole(session, ['super_admin']);
+      const businesses = await bkAll('businesses');
+      const subs = await bkAll('subscriptions');
+      const payments = await bkAll('payments');
+      const plans = await bkAll('plans');
+      const byBiz = {}; subs.forEach(s => { byBiz[s.businessId] = s; });
+      for(const b of businesses){ if(byBiz[b.id]) await bkComputeSubscription(b.id); }
+      const freshSubs = await bkAll('subscriptions');
+      const planPrice = {}; plans.forEach(p => { planPrice[p.id] = p.amount; });
+
+      const counts = { trial: 0, active: 0, expired: 0, other: 0 };
+      let mrr = 0;
+      const nearExpiry = [];
+      const upcomingRenewals = [];
+      const now = Date.now();
+      for(const s of freshSubs){
+        if(s.status === 'trial') counts.trial++;
+        else if(s.status === 'active'){ counts.active++; mrr += planPrice[s.planId] || 0; }
+        else if(s.status === 'expired') counts.expired++;
+        else counts.other++;
+        if((s.status === 'trial' || s.status === 'trial_expired') && s.daysRemaining != null && s.daysRemaining <= 7){
+          nearExpiry.push({ businessId: s.businessId, status: s.status, daysRemaining: s.daysRemaining });
+        }
+        if(s.status === 'active' && s.currentPeriodEnd){
+          const daysToRenew = Math.ceil((new Date(s.currentPeriodEnd).getTime() - now) / DAY_MS);
+          if(daysToRenew <= 7) upcomingRenewals.push({ businessId: s.businessId, currentPeriodEnd: s.currentPeriodEnd, daysToRenew });
+        }
+      }
+
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const paymentsToday = payments.filter(p => p.status === 'success' && (p.paidAt || p.createdAt).slice(0, 10) === todayStr).length;
+      const failedPayments = payments.filter(p => p.status === 'failed').length;
+
+      return {
+        totalBusinesses: businesses.length,
+        trialBusinesses: counts.trial,
+        activeBusinesses: counts.active,
+        expiredBusinesses: counts.expired,
+        monthlyRevenue: mrr,
+        annualRevenue: mrr * 12,
+        paymentsToday,
+        failedPayments,
+        upcomingRenewals,
+        businessesNearExpiry: nearExpiry,
+      };
+    },
+
+    async adminListPlans(session){
+      bkRequireRole(session, ['super_admin']);
+      return { plans: (await bkAll('plans')).sort((a, b) => a.sortOrder - b.sortOrder) };
+    },
+
+    async adminCreatePlan(session, body){
+      bkRequireRole(session, ['super_admin']);
+      const id = clean(body.id, 40) || bkNewId();
+      const plan = {
+        id, name: clean(body.name, 80), slug: clean(body.slug || body.name, 80).toLowerCase().replace(/\s+/g, '_'),
+        amount: Number(body.amount) || 0, currency: clean(body.currency, 10) || 'GHS', billingInterval: 'month',
+        isTrialPlan: false, isActive: body.isActive !== false, sortOrder: Number(body.sortOrder) || 99,
+        desc: clean(body.desc, 200),
+        limits: {
+          maxUsers: Number(body.maxUsers) || 0, maxProducts: Number(body.maxProducts) || 0,
+          maxBranches: Number(body.maxBranches) || 0, storageMb: Number(body.storageMb) || 0,
+        },
+        features: { reports: !!body.reports, aiFeatures: !!body.aiFeatures, premiumSupport: !!body.premiumSupport },
+      };
+      await bkPut('plans', plan);
+      return { plan };
+    },
+
+    async adminUpdatePlan(session, planId, body){
+      bkRequireRole(session, ['super_admin']);
+      const plan = await bkGetPlan(planId);
+      if(!plan) throw new Error('Plan not found.');
+      if(body.name != null) plan.name = clean(body.name, 80);
+      if(body.amount != null) plan.amount = Number(body.amount) || 0;
+      if(body.isActive != null) plan.isActive = !!body.isActive;
+      if(body.desc != null) plan.desc = clean(body.desc, 200);
+      if(body.sortOrder != null) plan.sortOrder = Number(body.sortOrder) || 0;
+      if(body.maxUsers != null) plan.limits.maxUsers = Number(body.maxUsers);
+      if(body.maxProducts != null) plan.limits.maxProducts = Number(body.maxProducts);
+      if(body.maxBranches != null) plan.limits.maxBranches = Number(body.maxBranches);
+      if(body.storageMb != null) plan.limits.storageMb = Number(body.storageMb);
+      if(body.reports != null) plan.features.reports = !!body.reports;
+      if(body.aiFeatures != null) plan.features.aiFeatures = !!body.aiFeatures;
+      if(body.premiumSupport != null) plan.features.premiumSupport = !!body.premiumSupport;
+      await bkPut('plans', plan);
+      return { plan };
+    },
+
+    async adminDeletePlan(session, planId){
+      bkRequireRole(session, ['super_admin']);
+      if(planId === 'starter_trial') throw new Error('The trial plan cannot be deleted.');
+      await bkDelete('plans', planId);
+      return { deleted: true };
+    },
+
+    async adminListBusinesses(session){
+      bkRequireRole(session, ['super_admin']);
+      const businesses = await bkAll('businesses');
+      const out = [];
+      for(const b of businesses){
+        const sub = await bkComputeSubscription(b.id);
+        out.push({ business: b, subscription: sub });
+      }
+      return { businesses: out };
+    },
+
+    async adminExtend(session, businessId, body){
+      bkRequireRole(session, ['super_admin']);
+      const days = Number(body.days) || 0;
+      if(days <= 0) throw new Error('Enter a positive number of days.');
+      const sub = await bkGet('subscriptions', businessId);
+      if(!sub) throw new Error('No subscription found for that business.');
+      const base = sub.status === 'trial' ? new Date(sub.trialEnd) : new Date(sub.currentPeriodEnd || Date.now());
+      const extended = new Date(base.getTime() + days * DAY_MS);
+      if(sub.status === 'trial') sub.trialEnd = extended.toISOString();
+      else { sub.status = 'active'; sub.currentPeriodEnd = extended.toISOString(); sub.graceEnd = null; }
+      await bkPut('subscriptions', sub);
+      await bkAudit(businessId, session.userId, 'subscription_extended', `+${days} day(s) by super admin`);
+      return { subscription: await bkComputeSubscription(businessId) };
+    },
+
+    async adminPause(session, businessId){
+      bkRequireRole(session, ['super_admin']);
+      const sub = await bkGet('subscriptions', businessId);
+      if(!sub) throw new Error('No subscription found for that business.');
+      sub.status = 'paused';
+      await bkPut('subscriptions', sub);
+      await bkAudit(businessId, session.userId, 'subscription_paused', 'by super admin');
+      return { subscription: sub };
+    },
+
+    async adminResume(session, businessId){
+      bkRequireRole(session, ['super_admin']);
+      const sub = await bkGet('subscriptions', businessId);
+      if(!sub) throw new Error('No subscription found for that business.');
+      sub.status = sub.currentPeriodEnd ? 'active' : 'trial';
+      await bkPut('subscriptions', sub);
+      await bkAudit(businessId, session.userId, 'subscription_resumed', 'by super admin');
+      return { subscription: await bkComputeSubscription(businessId) };
+    },
+
+    async listProducts(session, params){
+      let list = await bkAllByIndex('lproducts', 'by_business', session.businessId);
+      const search = clean(params.get('search') || '', 200).toLowerCase();
+      const category = clean(params.get('category') || '', 100);
+      const lowOnly = params.get('lowStockOnly') === 'true';
+      const branchId = clean(params.get('branchId') || '', 80);
+      if(search) list = list.filter(p => p.name.toLowerCase().includes(search) || (p.barcode || '').toLowerCase().includes(search));
+      if(category) list = list.filter(p => p.category === category);
+      if(lowOnly) list = list.filter(p => p.stock_quantity <= p.low_stock_alert_level);
+      if(branchId) list = list.filter(p => p.branchId === branchId || !p.branchId);
+      list = list.slice().sort((a, b) => a.name.localeCompare(b.name)).map(p => ({ ...p, low_stock: p.stock_quantity <= p.low_stock_alert_level }));
+      const { items, pagination } = bkPage(list, params);
+      return { products: items, pagination };
+    },
+
+    async createProduct(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const name = clean(body.name, 150);
+      const barcode = clean(body.barcode, 80);
+      const selling_price = Number(body.selling_price);
+      const cost_price = Number(body.cost_price);
+      const category = body.category ? clean(body.category, 80) : null;
+      const low_stock_alert_level = Math.max(parseInt(body.low_stock_alert_level, 10) || 0, 0);
+      const stock_quantity = Math.max(parseInt(body.stock_quantity, 10) || 0, 0);
+      const branchId = clean(body.branchId || '', 80) || null;
+      if(!name || !barcode || isNaN(selling_price) || isNaN(cost_price) || selling_price < 0 || cost_price < 0){
+        throw new Error('Name, barcode, selling price, and cost price are required.');
+      }
+      const existing = await bkAllByIndex('lproducts', 'by_business', session.businessId);
+      if(existing.some(p => p.barcode === barcode && (p.branchId || null) === branchId)) throw new Error('A product with that barcode already exists' + (branchId ? ' in this branch.' : '.'));
+
+      const product = {
+        id: bkNewId(), businessId: session.businessId, name, barcode, selling_price, cost_price,
+        category, low_stock_alert_level, stock_quantity, branchId, createdAt: new Date().toISOString(),
+        // Optional sector-specific fields — only stored when supplied, never required.
+        unit: body.unit ? clean(body.unit, 30) : '',
+        batchNumber: body.batchNumber ? clean(body.batchNumber, 60) : '',
+        expiryDate: body.expiryDate ? clean(body.expiryDate, 20) : '',
+        serialNumber: body.serialNumber ? clean(body.serialNumber, 80) : '',
+        imei: body.imei ? clean(body.imei, 40) : '',
+        warrantyMonths: body.warrantyMonths ? Math.max(parseInt(body.warrantyMonths, 10) || 0, 0) : 0,
+        size: body.size ? clean(body.size, 30) : '',
+        color: body.color ? clean(body.color, 30) : '',
+      };
+      await bkPut('lproducts', product);
+      await bkAudit(session.businessId, session.userId, 'product_created', name);
+      return { product };
+    },
+
+    async updateProduct(session, id, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const product = await bkGet('lproducts', id);
+      if(!product || product.businessId !== session.businessId) throw new Error('Product not found.');
+      const name = clean(body.name, 150);
+      const barcode = clean(body.barcode, 80);
+      const selling_price = Number(body.selling_price);
+      const cost_price = Number(body.cost_price);
+      if(!name || !barcode || isNaN(selling_price) || isNaN(cost_price) || selling_price < 0 || cost_price < 0){
+        throw new Error('Name, barcode, selling price, and cost price are required.');
+      }
+      const existing = await bkAllByIndex('lproducts', 'by_business', session.businessId);
+      if(existing.some(p => p.barcode === barcode && p.id !== id)) throw new Error('A product with that barcode already exists.');
+
+      const priceChanged = Number(product.selling_price) !== selling_price;
+      const prevPrice = product.selling_price;
+      Object.assign(product, {
+        name, barcode, selling_price, cost_price,
+        category: body.category ? clean(body.category, 80) : null,
+        low_stock_alert_level: Math.max(parseInt(body.low_stock_alert_level, 10) || 0, 0),
+        unit: body.unit !== undefined ? clean(body.unit, 30) : (product.unit || ''),
+        batchNumber: body.batchNumber !== undefined ? clean(body.batchNumber, 60) : (product.batchNumber || ''),
+        expiryDate: body.expiryDate !== undefined ? clean(body.expiryDate, 20) : (product.expiryDate || ''),
+        serialNumber: body.serialNumber !== undefined ? clean(body.serialNumber, 80) : (product.serialNumber || ''),
+        imei: body.imei !== undefined ? clean(body.imei, 40) : (product.imei || ''),
+        warrantyMonths: body.warrantyMonths !== undefined ? Math.max(parseInt(body.warrantyMonths, 10) || 0, 0) : (product.warrantyMonths || 0),
+        size: body.size !== undefined ? clean(body.size, 30) : (product.size || ''),
+        color: body.color !== undefined ? clean(body.color, 30) : (product.color || ''),
+        updatedAt: new Date().toISOString(),
+      });
+      await bkPut('lproducts', product);
+      await bkAudit(session.businessId, session.userId, 'product_updated', name, { recordLabel: name });
+      if(priceChanged){
+        await bkAudit(session.businessId, session.userId, 'price_changed', name, {
+          recordLabel: name, previousValue: prevPrice, newValue: selling_price,
+        });
+      }
+      return { product };
+    },
+
+    async deleteProduct(session, id){
+      bkRequireRole(session, ['owner', 'manager']);
+      const product = await bkGet('lproducts', id);
+      if(!product || product.businessId !== session.businessId) throw new Error('Product not found.');
+      await bkDelete('lproducts', id);
+      await bkAudit(session.businessId, session.userId, 'product_deleted', product.name);
+      return { ok: true };
+    },
+
+    async restockProduct(session, id, body){
+      bkRequireRole(session, ['owner', 'manager', 'storekeeper']);
+      await bkRequireActiveSubscription(session);
+      const product = await bkGet('lproducts', id);
+      if(!product || product.businessId !== session.businessId) throw new Error('Product not found.');
+      const quantity = parseInt(body.quantity, 10);
+      if(isNaN(quantity) || quantity <= 0) throw new Error('Enter a positive quantity.');
+      product.stock_quantity += quantity;
+      await bkPut('lproducts', product);
+      await bkAudit(session.businessId, session.userId, 'product_restocked', product.name + ' +' + quantity);
+      return { product };
+    },
+
+    async adjustProduct(session, id, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const product = await bkGet('lproducts', id);
+      if(!product || product.businessId !== session.businessId) throw new Error('Product not found.');
+      const change = parseInt(body.quantity_changed, 10);
+      if(isNaN(change) || change === 0) throw new Error('Enter a non-zero quantity.');
+      product.stock_quantity = Math.max(0, product.stock_quantity + change);
+      await bkPut('lproducts', product);
+      await bkAudit(session.businessId, session.userId, 'product_adjusted', product.name + ' ' + (change > 0 ? '+' : '') + change);
+      return { product };
+    },
+
+    async listSuppliers(session, params){
+      let list = await bkAllByIndex('suppliers', 'by_business', session.businessId);
+      const search = clean(params.get('search') || '', 200).toLowerCase();
+      const branchId = clean(params.get('branchId') || '', 80);
+      if(search) list = list.filter(s => s.name.toLowerCase().includes(search) || (s.phone || '').includes(search));
+      if(branchId) list = list.filter(s => s.branchId === branchId || !s.branchId);
+      list = list.slice().sort((a, b) => a.name.localeCompare(b.name));
+      const { items, pagination } = bkPage(list, params);
+      return { suppliers: items, pagination };
+    },
+
+    async createSupplier(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const name = clean(body.name, 150);
+      const phone = clean(body.phone, 40);
+      if(!name || !phone) throw new Error('Name and phone are required.');
+      const supplier = {
+        id: bkNewId(), businessId: session.businessId, name, phone,
+        email: body.email ? clean(body.email, 160) : null,
+        address: body.address ? clean(body.address, 200) : null,
+        branchId: clean(body.branchId || '', 80) || null,
+        createdAt: new Date().toISOString(),
+      };
+      await bkPut('suppliers', supplier);
+      await bkAudit(session.businessId, session.userId, 'supplier_created', name);
+      return { supplier };
+    },
+
+    async updateSupplier(session, id, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      const supplier = await bkGet('suppliers', id);
+      if(!supplier || supplier.businessId !== session.businessId) throw new Error('Supplier not found.');
+      const name = clean(body.name, 150);
+      const phone = clean(body.phone, 40);
+      if(!name || !phone) throw new Error('Name and phone are required.');
+      Object.assign(supplier, { name, phone, email: body.email ? clean(body.email, 160) : null, address: body.address ? clean(body.address, 200) : null });
+      await bkPut('suppliers', supplier);
+      await bkAudit(session.businessId, session.userId, 'supplier_updated', name);
+      return { supplier };
+    },
+
+    async deleteSupplier(session, id){
+      bkRequireRole(session, ['owner', 'manager']);
+      const supplier = await bkGet('suppliers', id);
+      if(!supplier || supplier.businessId !== session.businessId) throw new Error('Supplier not found.');
+      await bkDelete('suppliers', id);
+      await bkAudit(session.businessId, session.userId, 'supplier_deleted', supplier.name);
+      return { ok: true };
+    },
+
+    async listPurchases(session, params){
+      let list = (await bkAllByIndex('purchases', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const branchId = clean(params.get('branchId') || '', 80);
+      if(branchId) list = list.filter(p => p.branchId === branchId || !p.branchId);
+      const { items, pagination } = bkPage(list, params);
+      return { purchases: items, pagination };
+    },
+
+    async createPurchase(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const supplierId = clean(body.supplierId, 80);
+      const paymentStatus = clean(body.paymentStatus, 20) === 'paid' ? 'paid' : 'pending';
+      const items = Array.isArray(body.items) ? body.items : [];
+      const branchId = clean(body.branchId || '', 80) || null;
+      if(!supplierId) throw new Error('Add a supplier first.');
+      if(!items.length || items.some(i => !i.productId || isNaN(parseInt(i.quantity, 10)) || parseInt(i.quantity, 10) <= 0 || isNaN(Number(i.costPrice)) || Number(i.costPrice) < 0)){
+        throw new Error('Every line item needs a product, a positive quantity, and a cost price.');
+      }
+      const supplier = await bkGet('suppliers', supplierId);
+      if(!supplier || supplier.businessId !== session.businessId) throw new Error('Supplier not found.');
+
+      let total_cost = 0;
+      const resolvedItems = [];
+      for(const i of items){
+        const product = await bkGet('lproducts', i.productId);
+        if(!product || product.businessId !== session.businessId) throw new Error('One of the products was not found.');
+        const quantity = parseInt(i.quantity, 10);
+        const costPrice = Number(i.costPrice);
+        product.stock_quantity += quantity;
+        await bkPut('lproducts', product);
+        total_cost += quantity * costPrice;
+        resolvedItems.push({ productId: product.id, name: product.name, quantity, costPrice });
+      }
+
+      const purchase = {
+        id: bkNewId(), businessId: session.businessId, supplier_id: supplierId, supplier_name: supplier.name,
+        items: resolvedItems, total_cost, payment_status: paymentStatus, branchId, createdAt: new Date().toISOString(),
+      };
+      await bkPut('purchases', purchase);
+      await bkAudit(session.businessId, session.userId, 'purchase_created', supplier.name + ' — ' + total_cost.toFixed(2));
+      return { purchase };
+    },
+
+    async syncSales(session, body){
+      await bkRequireActiveSubscription(session);
+      const sales = Array.isArray(body.sales) ? body.sales : [];
+      const results = [];
+      for(const s of sales){
+        const existingByBiz = await bkAllByIndex('lsales', 'by_business', session.businessId);
+        const dup = existingByBiz.find(x => x.clientTxnId === s.clientTxnId);
+        if(dup){ results.push({ clientTxnId: s.clientTxnId, status: 'duplicate' }); continue; }
+
+        const items = Array.isArray(s.items) ? s.items : [];
+        for(const item of items){
+          const product = await bkGet('lproducts', item.productId);
+          if(product && product.businessId === session.businessId){
+            product.stock_quantity = Math.max(0, product.stock_quantity - Number(item.quantity || 0));
+            await bkPut('lproducts', product);
+          }
+        }
+        const total = Number(s.total) || items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unitPrice), 0);
+
+        // Upsert a lightweight customer record when the cashier captured a name/phone,
+        // so this integrates with the existing customers store rather than a separate list.
+        const customerName = clean(s.customerName || '', 120);
+        const customerPhone = clean(s.customerPhone || '', 40);
+        if(customerPhone){
+          const existingCustomers = await bkAllByIndex('customers', 'by_business', session.businessId);
+          let customer = existingCustomers.find(c => c.phone === customerPhone);
+          if(customer){
+            customer.name = customerName || customer.name;
+            customer.lastPurchaseAt = s.createdAt || new Date().toISOString();
+            customer.totalSpent = Number(customer.totalSpent || 0) + total;
+            await bkPut('customers', customer);
+          }else{
+            await bkPut('customers', {
+              id: bkNewId(), businessId: session.businessId, name: customerName || 'Walk-in Customer',
+              phone: customerPhone, totalSpent: total, createdAt: new Date().toISOString(), lastPurchaseAt: s.createdAt || new Date().toISOString(),
+            });
+          }
+        }
+
+        await bkPut('lsales', {
+          id: bkNewId(), businessId: session.businessId, clientTxnId: s.clientTxnId,
+          cashierId: session.userId, cashierName: session.name, items, total, branchId: s.branchId || null,
+          paymentType: s.paymentType || 'cash', createdAt: s.createdAt || new Date().toISOString(),
+          subtotal: Number(s.subtotal) || total, discount: Number(s.discount) || 0,
+          serviceCharge: Number(s.serviceCharge) || 0, taxRate: Number(s.taxRate) || 0, taxAmount: Number(s.taxAmount) || 0,
+          customerName: customerName || 'Walk-in Customer', customerPhone,
+          paymentReference: clean(s.paymentReference || '', 100),
+          amountPaid: Number(s.amountPaid) || total, changeAmount: Number(s.changeAmount) || 0,
+          tableNumber: clean(s.tableNumber || '', 30), waiter: clean(s.waiter || '', 80),
+        });
+        await bkAudit(session.businessId, session.userId, 'sale_created', `${items.length} item(s) — ${total.toFixed(2)}`, {
+          recordLabel: s.clientTxnId, newValue: total.toFixed(2),
+        });
+        results.push({ clientTxnId: s.clientTxnId, status: 'synced' });
+      }
+      return { results };
+    },
+
+    // Public — used when a customer scans the QR code on a receipt. Returns only
+    // a minimal, non-sensitive summary; no session/auth required.
+    async publicVerifyReceipt(params){
+      const businessId = clean((params && params.get('biz')) || '', 80);
+      const clientTxnId = clean((params && params.get('tx')) || '', 120);
+      if(!businessId || !clientTxnId) return { valid: false };
+      const sales = await bkAllByIndex('lsales', 'by_business', businessId);
+      const sale = sales.find(x => x.clientTxnId === clientTxnId);
+      if(!sale) return { valid: false };
+      const business = await bkGet('businesses', businessId);
+      return {
+        valid: true, businessName: business ? business.name : '', total: sale.total,
+        createdAt: sale.createdAt, clientTxnId: sale.clientTxnId, paymentType: sale.paymentType,
+      };
+    },
+
+    async reportDashboard(session, params){
+      const branchId = params && clean(params.get('branchId') || '', 80);
+      const byBranch = (list) => branchId ? list.filter(r => r.branchId === branchId || !r.branchId) : list;
+      const sales = byBranch(await bkAllByIndex('lsales', 'by_business', session.businessId));
+      const products = byBranch(await bkAllByIndex('lproducts', 'by_business', session.businessId));
+      const purchases = byBranch(await bkAllByIndex('purchases', 'by_business', session.businessId));
+      const costMap = new Map(products.map(p => [p.id, p.cost_price]));
+      const todayStr = new Date().toDateString();
+      const monthKey = bkYm(new Date());
+
+      const totalSalesToday = sales.filter(s => new Date(s.createdAt).toDateString() === todayStr).reduce((sum, s) => sum + s.total, 0);
+      const totalSalesThisMonth = sales.filter(s => bkYm(s.createdAt) === monthKey).reduce((sum, s) => sum + s.total, 0);
+      const totalRevenue = sales.reduce((sum, s) => sum + s.total, 0);
+      const totalProfit = sales.reduce((sum, s) => sum + s.items.reduce((isum, i) => isum + (i.unitPrice - (costMap.get(i.productId) || 0)) * i.quantity, 0), 0);
+      const lowStockItemsCount = products.filter(p => p.stock_quantity <= p.low_stock_alert_level).length;
+      const supplierDebt = purchases.filter(p => p.payment_status === 'pending').reduce((sum, p) => sum + p.total_cost, 0);
+
+      return {
+        totalSalesToday, totalSalesThisMonth, totalRevenue, totalProfit,
+        totalCustomers: 0, totalProducts: products.length, lowStockItemsCount,
+        outstandingCustomerDebt: 0, supplierDebt,
+      };
+    },
+
+    async reportCashflow(session){
+      const sales = await bkAllByIndex('lsales', 'by_business', session.businessId);
+      const purchases = await bkAllByIndex('purchases', 'by_business', session.businessId);
+      const cashSalesTotal = sales.filter(s => s.paymentType === 'cash').reduce((sum, s) => sum + s.total, 0);
+      const creditSalesTotal = sales.filter(s => s.paymentType === 'credit').reduce((sum, s) => sum + s.total, 0);
+      const pendingPayments = purchases.filter(p => p.payment_status === 'pending').reduce((sum, p) => sum + p.total_cost, 0);
+      return { cashSalesTotal, creditSalesTotal, totalCollected: cashSalesTotal, pendingPayments };
+    },
+
+    async reportSuppliers(session){
+      const purchases = await bkAllByIndex('purchases', 'by_business', session.businessId);
+      const totalPurchases = purchases.reduce((sum, p) => sum + p.total_cost, 0);
+      const totalSupplierPayments = purchases.filter(p => p.payment_status === 'paid').reduce((sum, p) => sum + p.total_cost, 0);
+      const supplierDebtsOutstanding = purchases.filter(p => p.payment_status === 'pending').reduce((sum, p) => sum + p.total_cost, 0);
+      return { totalPurchases, totalSupplierPayments, supplierDebtsOutstanding };
+    },
+
+    async reportProductsTop(session, params, ascending){
+      const limit = Math.max(parseInt(params.get('limit') || '10', 10) || 10, 1);
+      const sales = await bkAllByIndex('lsales', 'by_business', session.businessId);
+      const agg = new Map();
+      for(const s of sales){
+        for(const i of s.items){
+          const cur = agg.get(i.productId) || { name: i.name, unitsSold: 0, revenue: 0 };
+          cur.unitsSold += Number(i.quantity);
+          cur.revenue += Number(i.quantity) * Number(i.unitPrice);
+          agg.set(i.productId, cur);
+        }
+      }
+      let list = [...agg.values()].sort((a, b) => ascending ? a.unitsSold - b.unitsSold : b.unitsSold - a.unitsSold);
+      return { products: list.slice(0, limit) };
+    },
+
+    async reportSalesTrend(session, params){
+      const period = params.get('period') || 'daily';
+      const from = params.get('from') ? new Date(params.get('from')) : null;
+      const to = params.get('to') ? new Date(params.get('to')) : null;
+      const cashierId = params.get('cashierId');
+      const branchId = clean(params.get('branchId') || '', 80);
+      let sales = await bkAllByIndex('lsales', 'by_business', session.businessId);
+      if(from) sales = sales.filter(s => new Date(s.createdAt) >= from);
+      if(to) sales = sales.filter(s => new Date(s.createdAt) <= new Date(to.getTime() + 24 * 3600 * 1000 - 1));
+      if(cashierId) sales = sales.filter(s => s.cashierId === cashierId);
+      if(branchId) sales = sales.filter(s => s.branchId === branchId || !s.branchId);
+
+      const products = await bkAllByIndex('lproducts', 'by_business', session.businessId);
+      const costMap = new Map(products.map(p => [p.id, p.cost_price]));
+
+      const bucketKey = (d) => {
+        const dt = new Date(d);
+        if(period === 'monthly') return bkYm(dt);
+        if(period === 'weekly'){
+          const day = new Date(dt); day.setDate(day.getDate() - day.getDay());
+          return day.toISOString().slice(0, 10);
+        }
+        return dt.toISOString().slice(0, 10);
+      };
+      const buckets = new Map();
+      const profitBuckets = new Map();
+      for(const s of sales){
+        const key = bucketKey(s.createdAt);
+        buckets.set(key, (buckets.get(key) || 0) + s.total);
+        const profit = (s.items || []).reduce((sum, i) => sum + (i.unitPrice - (costMap.get(i.productId) || 0)) * i.quantity, 0);
+        profitBuckets.set(key, (profitBuckets.get(key) || 0) + profit);
+      }
+      const labels = [...buckets.keys()].sort();
+      const data = labels.map(l => buckets.get(l));
+      const profit = labels.map(l => profitBuckets.get(l) || 0);
+      return { labels, data, profit };
+    },
+
+    // ================================================================
+    // STAGE 13 — multi-branch management, transfers, settings, import/export
+    // ================================================================
+
+    // --- Branches ---
+    async listReferrals(session){
+      const referrals = (await bkAllByIndex('referrals', 'by_referrer', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const convertedCount = referrals.filter(r => r.status === 'converted').length;
+      return { referralCode: session.businessId, referrals, convertedCount };
+    },
+
+    async listBranches(session){
+      const branches = (await bkAllByIndex('branches', 'by_business', session.businessId))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      return { branches };
+    },
+
+    async createBranch(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      const name = clean(body.name, 150);
+      if(!name) throw new Error('Branch name is required.');
+      const branch = {
+        id: bkNewId(), businessId: session.businessId, name,
+        address: clean(body.address || '', 200),
+        phone: clean(body.phone || '', 40),
+        manager: clean(body.manager || '', 120),
+        hours: clean(body.hours || '', 100),
+        status: body.status === 'inactive' ? 'inactive' : 'active',
+        createdAt: new Date().toISOString(),
+      };
+      await bkPut('branches', branch);
+      await bkAudit(session.businessId, session.userId, 'branch_created', name, { module: 'Branches' });
+      return { branch };
+    },
+
+    async updateBranch(session, id, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      const branch = await bkGet('branches', id);
+      if(!branch || branch.businessId !== session.businessId) throw new Error('Branch not found.');
+      const name = clean(body.name, 150);
+      if(!name) throw new Error('Branch name is required.');
+      Object.assign(branch, {
+        name,
+        address: clean(body.address || '', 200),
+        phone: clean(body.phone || '', 40),
+        manager: clean(body.manager || '', 120),
+        hours: clean(body.hours || '', 100),
+        status: body.status === 'inactive' ? 'inactive' : 'active',
+      });
+      await bkPut('branches', branch);
+      await bkAudit(session.businessId, session.userId, 'branch_updated', name, { module: 'Branches' });
+      return { branch };
+    },
+
+    async deleteBranch(session, id){
+      bkRequireRole(session, ['owner']);
+      const branch = await bkGet('branches', id);
+      if(!branch || branch.businessId !== session.businessId) throw new Error('Branch not found.');
+      const staff = (await bkAllByIndex('users', 'by_business', session.businessId)).filter(u => u.branchId === id);
+      if(staff.length) throw new Error('Reassign staff away from this branch before deleting it.');
+      await bkDelete('branches', id);
+      await bkAudit(session.businessId, session.userId, 'branch_deleted', branch.name, { module: 'Branches' });
+      return { ok: true };
+    },
+
+    // --- Branch transfers ---
+    async listTransfers(session, params){
+      let list = (await bkAllByIndex('transfers', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const branchId = clean(params.get('branchId') || '', 80);
+      if(branchId) list = list.filter(t => t.fromBranchId === branchId || t.toBranchId === branchId);
+      return { transfers: list };
+    },
+
+    async createTransfer(session, body){
+      bkRequireRole(session, ['owner', 'manager', 'storekeeper']);
+      const fromBranchId = clean(body.fromBranchId, 80);
+      const toBranchId = clean(body.toBranchId, 80);
+      const items = Array.isArray(body.items) ? body.items : [];
+      if(!fromBranchId || !toBranchId) throw new Error('Choose both a source and destination branch.');
+      if(fromBranchId === toBranchId) throw new Error('Source and destination branches must be different.');
+      if(!items.length || items.some(i => !i.productId || isNaN(parseInt(i.quantity, 10)) || parseInt(i.quantity, 10) <= 0)){
+        throw new Error('Add at least one line item with a product and a positive quantity.');
+      }
+      const fromBranch = await bkGet('branches', fromBranchId);
+      const toBranch = await bkGet('branches', toBranchId);
+      if(!fromBranch || fromBranch.businessId !== session.businessId) throw new Error('Source branch not found.');
+      if(!toBranch || toBranch.businessId !== session.businessId) throw new Error('Destination branch not found.');
+
+      const resolvedItems = [];
+      for(const i of items){
+        const product = await bkGet('lproducts', i.productId);
+        if(!product || product.businessId !== session.businessId) throw new Error('One of the products was not found.');
+        resolvedItems.push({ productId: product.id, name: product.name, barcode: product.barcode, quantity: parseInt(i.quantity, 10) });
+      }
+
+      const all = await bkAllByIndex('transfers', 'by_business', session.businessId);
+      const transferNumber = 'TRF-' + String(all.length + 1).padStart(5, '0');
+
+      const transfer = {
+        id: bkNewId(), businessId: session.businessId, transferNumber,
+        fromBranchId, fromBranchName: fromBranch.name, toBranchId, toBranchName: toBranch.name,
+        items: resolvedItems, requestedBy: session.name, approvedBy: null,
+        status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      };
+      await bkPut('transfers', transfer);
+      await bkAudit(session.businessId, session.userId, 'transfer_requested', transferNumber, { module: 'Transfers' });
+      return { transfer };
+    },
+
+    async approveTransfer(session, id){
+      bkRequireRole(session, ['owner', 'manager']);
+      const transfer = await bkGet('transfers', id);
+      if(!transfer || transfer.businessId !== session.businessId) throw new Error('Transfer not found.');
+      if(transfer.status !== 'pending') throw new Error('Only a pending transfer can be approved.');
+
+      // Verify (but do not yet move) stock — the actual movement happens on completion.
+      for(const i of transfer.items){
+        const product = await bkGet('lproducts', i.productId);
+        if(!product || product.stock_quantity < i.quantity){
+          throw new Error(`Not enough stock of "${i.name}" to approve this transfer.`);
+        }
+      }
+      transfer.status = 'approved';
+      transfer.approvedBy = session.name;
+      transfer.updatedAt = new Date().toISOString();
+      await bkPut('transfers', transfer);
+      await bkAudit(session.businessId, session.userId, 'transfer_approved', transfer.transferNumber, { module: 'Transfers' });
+      return { transfer };
+    },
+
+    async completeTransfer(session, id){
+      bkRequireRole(session, ['owner', 'manager', 'storekeeper']);
+      const transfer = await bkGet('transfers', id);
+      if(!transfer || transfer.businessId !== session.businessId) throw new Error('Transfer not found.');
+      if(transfer.status !== 'approved') throw new Error('Only an approved transfer can be completed.');
+
+      for(const i of transfer.items){
+        const source = await bkGet('lproducts', i.productId);
+        if(!source || source.stock_quantity < i.quantity) throw new Error(`Not enough stock of "${i.name}" to complete this transfer.`);
+        source.stock_quantity -= i.quantity;
+        await bkPut('lproducts', source);
+
+        // Destination branch keeps its own inventory row for the same barcode —
+        // create one if this is the first time that product reaches this branch.
+        const businessProducts = await bkAllByIndex('lproducts', 'by_business', session.businessId);
+        let dest = businessProducts.find(p => p.barcode === source.barcode && p.branchId === transfer.toBranchId);
+        if(dest){
+          dest.stock_quantity += i.quantity;
+          await bkPut('lproducts', dest);
+        }else{
+          dest = {
+            id: bkNewId(), businessId: session.businessId, name: source.name, barcode: source.barcode,
+            selling_price: source.selling_price, cost_price: source.cost_price, category: source.category,
+            low_stock_alert_level: source.low_stock_alert_level, stock_quantity: i.quantity,
+            branchId: transfer.toBranchId, createdAt: new Date().toISOString(),
+          };
+          await bkPut('lproducts', dest);
+        }
+      }
+      transfer.status = 'completed';
+      transfer.updatedAt = new Date().toISOString();
+      await bkPut('transfers', transfer);
+      await bkAudit(session.businessId, session.userId, 'transfer_completed', transfer.transferNumber, { module: 'Transfers' });
+      return { transfer };
+    },
+
+    async cancelTransfer(session, id){
+      bkRequireRole(session, ['owner', 'manager']);
+      const transfer = await bkGet('transfers', id);
+      if(!transfer || transfer.businessId !== session.businessId) throw new Error('Transfer not found.');
+      if(!['pending', 'approved'].includes(transfer.status)) throw new Error('Only a pending or approved transfer can be cancelled.');
+      transfer.status = 'cancelled';
+      transfer.updatedAt = new Date().toISOString();
+      await bkPut('transfers', transfer);
+      await bkAudit(session.businessId, session.userId, 'transfer_cancelled', transfer.transferNumber, { module: 'Transfers' });
+      return { transfer };
+    },
+
+    // --- Business settings / receipt settings / preferences ---
+    async getSettings(session){
+      let settings = await bkGet('businessSettings', session.businessId);
+      const business = await bkGet('businesses', session.businessId);
+      if(!settings){
+        settings = bkDefaultSettings(session.businessId, business || {});
+        await bkPut('businessSettings', settings);
+      }else if(!settings.modules){
+        // Backfills businesses registered before the sector/module feature existed.
+        settings.modules = defaultModuleState((business || {}).sector || '');
+        await bkPut('businessSettings', settings);
+      }
+      return { settings, sector: (business || {}).sector || '', sectorLabel: (business || {}).sectorLabel || '' };
+    },
+
+    async updateSettings(session, section, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      if(!['general', 'receipt', 'preferences', 'modules', 'security', 'till', 'notifications'].includes(section)) throw new Error('Unknown settings section.');
+      let settings = await bkGet('businessSettings', session.businessId);
+      if(!settings){
+        const business = await bkGet('businesses', session.businessId);
+        settings = bkDefaultSettings(session.businessId, business || {});
+      }
+      settings[section] = { ...settings[section], ...(body || {}) };
+      settings.updatedAt = new Date().toISOString();
+      await bkPut('businessSettings', settings);
+
+      // Keep the core business record's name/contact fields in sync so the
+      // rest of the app (receipts, registration receipt, etc.) stays consistent.
+      if(section === 'general'){
+        const business = await bkGet('businesses', session.businessId);
+        if(business){
+          if(body.name != null) business.name = clean(body.name, 120);
+          if(body.email != null) business.email = clean(body.email, 160);
+          if(body.phone != null) business.phone = clean(body.phone, 40);
+          if(body.address != null) business.address = clean(body.address, 200);
+          await bkPut('businesses', business);
+        }
+      }
+      await bkAudit(session.businessId, session.userId, 'settings_updated', section, { module: 'Settings' });
+      return { settings };
+    },
+
+    // --- Data import ---
+    async importData(session, body){
+      bkRequireRole(session, ['owner', 'manager']);
+      await bkRequireActiveSubscription(session);
+      const type = clean(body.type, 40);
+      const branchId = clean(body.branchId || '', 80) || null;
+      const rows = Array.isArray(body.rows) ? body.rows : [];
+      if(!['products', 'customers', 'suppliers', 'opening_stock'].includes(type)) throw new Error('Unknown import type.');
+      if(!rows.length) throw new Error('The file had no rows to import.');
+
+      let inserted = 0;
+      const errors = [];
+      const existingProducts = type === 'products' || type === 'opening_stock'
+        ? await bkAllByIndex('lproducts', 'by_business', session.businessId) : [];
+
+      for(let idx = 0; idx < rows.length; idx++){
+        const r = rows[idx];
+        const rowNum = idx + 2; // header is row 1
+        try{
+          if(type === 'products'){
+            const name = clean(r.name, 150);
+            const barcode = clean(r.barcode, 80);
+            const selling_price = Number(r.selling_price);
+            const cost_price = Number(r.cost_price);
+            const stock_quantity = Math.max(parseInt(r.stock_quantity, 10) || 0, 0);
+            const low_stock_alert_level = Math.max(parseInt(r.low_stock_alert_level, 10) || 0, 0);
+            if(!name || !barcode) throw new Error('name and barcode are required');
+            if(isNaN(selling_price) || isNaN(cost_price)) throw new Error('selling_price and cost_price must be numbers');
+            if(existingProducts.some(p => p.barcode === barcode && (p.branchId || null) === branchId)) throw new Error('duplicate barcode');
+            const product = {
+              id: bkNewId(), businessId: session.businessId, name, barcode, selling_price, cost_price,
+              category: r.category ? clean(r.category, 80) : null, low_stock_alert_level, stock_quantity,
+              branchId, createdAt: new Date().toISOString(),
+            };
+            await bkPut('lproducts', product);
+            existingProducts.push(product);
+            inserted++;
+          }else if(type === 'customers'){
+            const name = clean(r.name, 150);
+            const phone = clean(r.phone, 40);
+            if(!name) throw new Error('name is required');
+            await bkPut('customers', {
+              id: bkNewId(), businessId: session.businessId, name, phone,
+              email: r.email ? clean(r.email, 160) : null, balance: Number(r.balance) || 0,
+              branchId, createdAt: new Date().toISOString(),
+            });
+            inserted++;
+          }else if(type === 'suppliers'){
+            const name = clean(r.name, 150);
+            const phone = clean(r.phone, 40);
+            if(!name || !phone) throw new Error('name and phone are required');
+            await bkPut('suppliers', {
+              id: bkNewId(), businessId: session.businessId, name, phone,
+              email: r.email ? clean(r.email, 160) : null, address: r.address ? clean(r.address, 200) : null,
+              branchId, createdAt: new Date().toISOString(),
+            });
+            inserted++;
+          }else if(type === 'opening_stock'){
+            const barcode = clean(r.barcode, 80);
+            const quantity = parseInt(r.quantity, 10);
+            if(!barcode) throw new Error('barcode is required');
+            if(isNaN(quantity) || quantity < 0) throw new Error('quantity must be a non-negative number');
+            const product = existingProducts.find(p => p.barcode === barcode && ((p.branchId || null) === branchId || !branchId));
+            if(!product) throw new Error('no matching product for this barcode — import products first');
+            product.stock_quantity = (product.stock_quantity || 0) + quantity;
+            await bkPut('lproducts', product);
+            inserted++;
+          }
+        }catch(e){
+          errors.push({ row: rowNum, reason: e.message });
+        }
+      }
+
+      const log = {
+        id: bkNewId(), businessId: session.businessId, type, inserted, skipped: errors.length,
+        total: rows.length, errors: errors.slice(0, 50), createdAt: new Date().toISOString(),
+      };
+      await bkPut('importLogs', log);
+      await bkAudit(session.businessId, session.userId, 'data_imported', `${type}: ${inserted} inserted, ${errors.length} skipped`, { module: 'Import' });
+      return { summary: log };
+    },
+
+    async listImportLogs(session){
+      const logs = (await bkAllByIndex('importLogs', 'by_business', session.businessId))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return { logs };
+    },
+
+    // --- Advanced search ---
+    async advancedSearch(session, params){
+      const q = clean(params.get('q') || '', 200).toLowerCase();
+      if(!q) return { products: [], customers: [], suppliers: [], sales: [], transfers: [], invoices: [] };
+      const businessId = session.businessId;
+
+      const [products, customers, suppliers, sales, transfers, invoices] = await Promise.all([
+        bkAllByIndex('lproducts', 'by_business', businessId),
+        bkAllByIndex('customers', 'by_business', businessId),
+        bkAllByIndex('suppliers', 'by_business', businessId),
+        bkAllByIndex('lsales', 'by_business', businessId),
+        bkAllByIndex('transfers', 'by_business', businessId),
+        bkAllByIndex('invoices', 'by_business', businessId),
+      ]);
+
+      return {
+        products: products.filter(p => p.name.toLowerCase().includes(q) || (p.barcode || '').toLowerCase().includes(q)).slice(0, 20),
+        customers: customers.filter(c => c.name.toLowerCase().includes(q) || (c.phone || '').includes(q)).slice(0, 20),
+        suppliers: suppliers.filter(s => s.name.toLowerCase().includes(q) || (s.phone || '').includes(q)).slice(0, 20),
+        sales: sales.filter(s => (s.clientTxnId || '').toLowerCase().includes(q)).slice(0, 20),
+        transfers: transfers.filter(t => (t.transferNumber || '').toLowerCase().includes(q)).slice(0, 20),
+        invoices: invoices.filter(i => (i.id || '').toLowerCase().includes(q) || (i.reference || '').toLowerCase().includes(q)).slice(0, 20),
+      };
+    },
+
+    // --- Super Admin: branch oversight ---
+    async adminListBranches(session){
+      bkRequireRole(session, ['super_admin']);
+      const branches = await bkAll('branches');
+      const businesses = await bkAll('businesses');
+      const nameById = {}; businesses.forEach(b => { nameById[b.id] = b.name; });
+      return { branches: branches.map(b => ({ ...b, businessName: nameById[b.businessId] || 'Unknown business' })) };
+    },
+
+    async adminToggleBranch(session, id){
+      bkRequireRole(session, ['super_admin']);
+      const branch = await bkGet('branches', id);
+      if(!branch) throw new Error('Branch not found.');
+      branch.status = branch.status === 'active' ? 'inactive' : 'active';
+      await bkPut('branches', branch);
+      await bkAudit(branch.businessId, session.userId, 'branch_toggled_by_admin', branch.name + ' — now ' + branch.status, { module: 'Branches' });
+      return { branch };
+    },
+  };
+
+module.exports = { backend };
