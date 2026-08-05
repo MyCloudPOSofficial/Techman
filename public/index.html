@@ -5882,11 +5882,7 @@
   // file by running, in the browser console:
   //   localStorage.setItem('cloudpos_api_base', 'https://your-api.example.com')
   // then reloading.
-  const API_BASE_URL = (
-    (typeof window !== 'undefined' && window.CLOUD_POS_API_BASE) ||
-    (function(){ try{ return window.localStorage.getItem('cloudpos_api_base'); }catch(e){ return null; } })() ||
-    'http://localhost:8080'
-  ).replace(/\/$/, '');
+  const API_BASE_URL = "https://techman-production.up.railway.app";
 
   const SESSION_STORAGE_KEY = 'cloudpos_session_token';
   function saveSessionToken(token){
